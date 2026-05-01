@@ -1,0 +1,42 @@
+# ============================================================
+#  .gitignore — Multi-Threaded Transaction Processing System
+# ============================================================
+
+# ── Compiled binary ──────────────────────────────────────────
+txn_system
+
+# ── Object files ─────────────────────────────────────────────
+*.o
+
+# ── SQLite database files ─────────────────────────────────────
+*.db
+*.db-wal
+*.db-shm
+
+# ── SQLite3 stub (sandbox only — not needed on real machine) ──
+sqlite3.h
+sqlite3.c
+sqlite3_stub.c
+sqlite3_stub.o
+
+# ── Runtime IPC artifacts ────────────────────────────────────
+# These are created at runtime and cleaned up on shutdown.
+# If the program crashes they may be left behind — don't commit them.
+/tmp/txn_query_pipe
+
+# ── Editor and IDE files ─────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Build artifacts ───────────────────────────────────────────
+*.out
+*.dSYM/
+core
+core.*
+
+# ── Logs ─────────────────────────────────────────────────────
+*.log
