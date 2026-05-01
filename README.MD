@@ -1,95 +1,151 @@
 # Multi-Threaded Transaction Processing System
 
-> **OS Project — C++17 · POSIX Threads · Shared Memory · Named Pipes · SQLite3**
+<div align="center">
 
-A production-quality simulation of a banking transaction pipeline built entirely with low-level OS primitives. Every transaction travels through three thread stages connected by two different IPC mechanisms — demonstrating the Producer-Consumer problem, semaphore synchronization, mutex locks, and persistent database storage in a single working system.
+![C++17](https://img.shields.io/badge/C%2B%2B-17-blue?style=for-the-badge&logo=cplusplus)
+![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20WSL-orange?style=for-the-badge&logo=linux)
+![SQLite](https://img.shields.io/badge/SQLite-3-lightblue?style=for-the-badge&logo=sqlite)
+![Threads](https://img.shields.io/badge/POSIX-Threads-green?style=for-the-badge)
+![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
+
+**OS Project — FAST University**
+Huzaifa Ahmed Bari `24k-0847` · Shoaib Hayat `24k-1028`
+Course: Operating Systems · Instructor: Sir Minhal Raza
+
+</div>
+
+---
+
+## Overview
+
+A complete, production-quality simulation of a multi-stage banking transaction pipeline built entirely with low-level OS primitives. Every transaction travels through **three thread stages** connected by **two different IPC mechanisms**, demonstrating the Producer-Consumer problem, semaphore synchronization, mutex locks, signal handling, and persistent database storage — all working together in one running system.
+
+The system features a **rich terminal UI** with ANSI colors, bordered panels, per-thread color identity, and a **step-by-step guided wizard** for manual transaction input that never gets interrupted by background monitoring.
 
 ---
 
 ## Pipeline Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                   PRODUCER THREADS                          │
-│          SLOW  ·  FAST  ·  BURST  ·  MANUAL INPUT           │
-└────────────────────────┬────────────────────────────────────┘
-                         │
+┌──────────────────────────────────────────────────────────────┐
+│                     PRODUCER THREADS                         │
+│                                                              │
+│   [AUTO]   SLOW (800ms) · FAST (200ms) · BURST (4 rapid)     │
+│   [MANUAL] Step-by-step guided wizard input                  │
+└────────────────────────┬─────────────────────────────────────┘
+                         │  1 second transition delay
                          ▼
-         ┌───────────────────────────────┐
-         │   POSIX SHARED MEMORY         │
-         │   /dev/shm/txn_shared_buffer  │
-         │   Circular buffer · 8 slots   │
-         │   sem_empty + sem_filled      │
-         │   + pthread_mutex             │
-         └───────────────┬───────────────┘
-                         │
+         ┌─────────────────────────────────┐
+         │    POSIX SHARED MEMORY          │
+         │  /dev/shm/txn_shared_buffer     │
+         │                                 │
+         │  Circular buffer · 8 slots      │
+         │  sem_empty + sem_filled         │
+         │  + pthread_mutex (process-shared│
+         └────────────────┬────────────────┘
+                          │  1 second transition delay
+                          ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    VALIDATOR THREADS (×2)                    │
+│                                                              │
+│   Session check → Balance check → SQL query builder          │
+│   Marks: PENDING → PROCESSING → DONE | REJECTED              │
+└────────────────────────┬─────────────────────────────────────┘
+                         │  1 second transition delay
                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  VALIDATOR THREADS                          │
-│     Session check → Balance check → SQL query builder       │
-└────────────────────────┬────────────────────────────────────┘
-                         │
+         ┌─────────────────────────────────┐
+         │    NAMED PIPE (FIFO)            │
+         │  /tmp/txn_query_pipe            │
+         │                                 │
+         │  512-byte fixed-size messages   │
+         │  Atomic kernel-buffered writes  │
+         │  Auto-blocking reads            │
+         └────────────────┬────────────────┘
+                          │  1 second transition delay
+                          ▼
+┌──────────────────────────────────────────────────────────────┐
+│                  DB UPDATER THREADS (×2)                     │
+│                                                              │
+│   BEGIN · INSERT into transactions · UPDATE users · COMMIT   │
+│   Logic-free executor — runs pre-built SQL from Validator    │
+└────────────────────────┬─────────────────────────────────────┘
                          ▼
-         ┌───────────────────────────────┐
-         │   NAMED PIPE (FIFO)           │
-         │   /tmp/txn_query_pipe         │
-         │   512-byte fixed-size msgs    │
-         │   Atomic kernel-buffered      │
-         └───────────────┬───────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                 DB UPDATER THREADS                          │
-│         BEGIN · INSERT · UPDATE · COMMIT                    │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-         ┌───────────────────────────────┐
-         │   SQLite3 (WAL mode)          │
-         │   transactions.db             │
-         │   4 tables · mutex protected  │
-         └───────────────────────────────┘
+         ┌─────────────────────────────────┐
+         │    SQLite3  (WAL mode)          │
+         │  transactions.db                │
+         │                                 │
+         │  4 tables · mutex protected     │
+         │  Concurrent reads allowed       │
+         │  Crash-safe atomic commits      │
+         └─────────────────────────────────┘
 
-   Supporting: Logger Thread (sole stdout owner)
-               Monitor Thread (live snapshots every 2s)
+  Supporting Threads:
+  ┌─────────────────────────────────────────────────────────┐
+  │  LOGGER  — sole stdout owner · async non-blocking queue │
+  │  MONITOR — read-only · 2s interval · live panel output  │
+  │            pauses automatically during manual input     │
+  └─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Features
 
-- **Two-stage Producer-Consumer pipeline** using different IPC mechanisms at each stage
-- **POSIX Shared Memory** (`shm_open` + `mmap`) for the structured Transaction buffer
+### Pipeline & IPC
+- **Two-stage Producer-Consumer pipeline** using different IPC at each stage
+- **POSIX Shared Memory** (`shm_open` + `mmap`) for structured Transaction buffer
 - **Named Pipe / FIFO** (`mkfifo`) for streaming pre-built SQL query strings
-- **Counting semaphores** prevent buffer overflow and underflow without busy-waiting
+- **Counting semaphores** prevent buffer overflow and underflow — zero busy-waiting
 - **Mutex locks** protect all shared state (buffer, database connection, log queue)
-- **Three automatic producer modes** — SLOW (800ms), FAST (200ms), BURST (4 rapid then pause)
-- **Manual input mode** — type transactions live while the system runs
-- **Session & balance validation** — user 5 always rejected (no session); insufficient funds rejected
-- **Atomic database transactions** — `BEGIN; INSERT + UPDATE; COMMIT` ensures consistency
-- **WAL mode SQLite** — readers never blocked by concurrent writers
-- **Dedicated logger thread** — sole owner of stdout, async non-blocking queue
-- **Live monitor panels** — bordered snapshots every 2 seconds with buffer occupancy bar
+
+### Producer Modes
+- **SLOW** — one transaction every 800ms, simulates light load
+- **FAST** — one transaction every 200ms, simulates heavy load
+- **BURST** — 4 rapid transactions then 2-second pause, simulates batch
+- **MANUAL** — step-by-step guided wizard with numbered menus and validation
+
+### Validation
+- **Session check** — user 5 (Eve) has no active session, always rejected
+- **Balance check** — withdrawal/transfer exceeding balance is rejected
+- **Pre-built SQL** — validator builds complete INSERT+UPDATE query, updater just executes
+
+### Database
+- **WAL mode SQLite** — concurrent readers never blocked by writers
+- **Atomic transactions** — `BEGIN; INSERT + UPDATE; COMMIT` — all-or-nothing
+- **4 tables** — `users`, `sessions`, `raw_transactions`, `transactions`
+- **Full audit trail** — every transaction recorded from creation to commit or rejection
+
+### Terminal UI
+- **ANSI color system** — each thread type has a unique color identity
+- **Bordered panels** — box-drawing characters for all major output
+- **Step-by-step wizard** — numbered menus replace free-text input (no more typos)
+- **Monitor panels** — live snapshots with ASCII buffer bar and throughput
+- **1-second delays** — each pipeline stage transition is clearly visible
+- **Non-interrupting monitor** — pauses automatically while user is typing
+
+### System Quality
 - **Signal handling** — `Ctrl+C` triggers fully ordered graceful shutdown
-- **Rich terminal UI** — ANSI colors, box-drawing characters, per-thread color identity
-- **1-second transition delays** — each pipeline stage change is clearly visible
+- **Ordered shutdown** — producers → validators → pipe close → updaters → monitor
+- **Zero data loss** — every transaction in the pipeline is committed before exit
+- **Command-line modes** — `--auto`, `--manual`, `--both`
 
 ---
 
 ## OS Concepts Demonstrated
 
-| Concept | Implementation |
-|---|---|
-| POSIX Threads | `pthread_create`, `pthread_join` for all 9 thread types |
-| Semaphores | `sem_init`, `sem_wait`, `sem_post` — counting semaphores for buffer slots |
-| Mutex Locks | `pthread_mutex_lock` protecting buffer, database, log queue |
-| Shared Memory | `shm_open`, `ftruncate`, `mmap`, `shm_unlink` |
-| Named Pipes | `mkfifo`, `open`, `write`, `read`, `unlink` |
-| Atomic Operations | `std::atomic<bool>` for shutdown flag, `std::atomic<int>` for transaction IDs |
-| Signal Handling | `sigaction` for `SIGINT`/`SIGTERM`, async-signal-safe handler |
-| Blocking I/O | `sem_wait` and pipe `read` sleep the thread — zero busy-waiting |
-| WAL Mode | SQLite Write-Ahead Logging for concurrent read-while-write |
-| Producer-Consumer | Two-stage pipeline — each validator is both consumer and producer |
+| Concept | Where Used | API |
+|---|---|---|
+| POSIX Threads | All 9 thread types | `pthread_create`, `pthread_join` |
+| Counting Semaphores | Shared memory buffer (empty + filled slots) | `sem_init`, `sem_wait`, `sem_post` |
+| Mutex Locks | Buffer, database connection, log queue | `pthread_mutex_lock/unlock` |
+| POSIX Shared Memory | Buffer 1 — Transaction struct storage | `shm_open`, `ftruncate`, `mmap`, `shm_unlink` |
+| Named Pipes / FIFO | Buffer 2 — SQL query string channel | `mkfifo`, `open`, `write`, `read` |
+| Atomic Operations | Shutdown flag, transaction ID counter, input flag | `std::atomic<bool/int>` |
+| Signal Handling | Graceful Ctrl+C / kill shutdown | `sigaction`, `SA_RESTART` |
+| Blocking I/O | `sem_wait` and pipe `read` sleep the thread | Zero busy-waiting |
+| WAL Mode | Concurrent read-while-write in SQLite | `PRAGMA journal_mode=WAL` |
+| Process-Shared Mutex | Mutex embedded in shared memory segment | `PTHREAD_PROCESS_SHARED` |
+| Producer-Consumer | Two-stage pipeline, validator is both | Consumer of SHM + Producer of FIFO |
 
 ---
 
@@ -97,21 +153,45 @@ A production-quality simulation of a banking transaction pipeline built entirely
 
 ```
 txn_system/
-├── main.cpp              # Entry point: signals, CLI args, thread lifecycle
-├── transaction.h         # Core Transaction struct — travels the full pipeline
-├── shared_buffer.h/.cpp  # POSIX Shared Memory circular queue (Buffer 1)
-├── fifo_queue.h/.cpp     # Named Pipe FIFO SQL channel (Buffer 2)
-├── logger.h/.cpp         # Dedicated logger thread — async queue → stdout
-├── ui.h/.cpp             # Terminal UI: ANSI colors, panels, input handling
-├── database.h/.cpp       # SQLite3 layer: WAL mode, mutex, prepared statements
-├── producer.h/.cpp       # SLOW/FAST/BURST auto + manual keyboard input
-├── validator.h/.cpp      # Session check → balance check → SQL builder
-├── updater.h/.cpp        # BEGIN/COMMIT SQL executor, EOF-driven shutdown
-├── monitor.h/.cpp        # Read-only periodic system observer
-├── Makefile              # Build, run, clean, db targets
-├── .gitignore            # Excludes binaries, .db files, object files
-├── LICENSE               # MIT License
-└── README.md             # This file
+│
+├── main.cpp              Entry point: signals, CLI args, thread lifecycle,
+│                         ordered graceful shutdown
+│
+├── transaction.h         Core Transaction struct — travels the full pipeline.
+│                         Fields added by each stage without removing previous ones
+│
+├── shared_buffer.h       POSIX Shared Memory circular queue interface
+├── shared_buffer.cpp     shm_open + mmap + semaphores + mutex implementation
+│
+├── fifo_queue.h          Named Pipe FIFO SQL channel interface
+├── fifo_queue.cpp        mkfifo + fixed 512-byte message protocol
+│
+├── logger.h              Async logger thread interface
+├── logger.cpp            Sole stdout owner — queue drained by dedicated thread
+│
+├── ui.h                  Terminal UI system interface
+├── ui.cpp                ANSI colors, box-drawing, step-by-step wizard panels
+│
+├── database.h            SQLite3 layer interface
+├── database.cpp          WAL mode, mutex protection, prepared statements
+│
+├── producer.h            Producer thread interface
+├── producer.cpp          SLOW/FAST/BURST auto modes + guided wizard input
+│
+├── validator.h           Validator thread interface
+├── validator.cpp         Session/balance check, SQL builder, FIFO writer
+│
+├── updater.h             DB Updater thread interface
+├── updater.cpp           BEGIN/COMMIT executor, EOF-driven shutdown
+│
+├── monitor.h             Monitor thread interface (includes g_input_active flag)
+├── monitor.cpp           Read-only observer, pauses during manual input
+│
+├── Makefile              Build, run, clean, db targets
+├── README.md             This file
+├── .gitignore            Excludes binaries, .db, .o files
+├── LICENSE               MIT License
+└── CONTRIBUTING.md       Contribution guide
 ```
 
 ---
@@ -119,74 +199,94 @@ txn_system/
 ## Requirements
 
 ```bash
-# Ubuntu / WSL
+# Ubuntu / WSL (one-time setup)
 sudo apt-get install g++ make libsqlite3-dev sqlite3
 ```
 
-| Dependency | Purpose |
-|---|---|
-| `g++` (C++17) | Compiler |
-| `libpthread` | POSIX threads, semaphores, mutexes |
-| `librt` | `shm_open` on some Linux versions |
-| `libsqlite3-dev` | SQLite3 embedded database |
+| Dependency | Version | Purpose |
+|---|---|---|
+| `g++` | C++17 | Compiler |
+| `libpthread` | POSIX | Threads, semaphores, mutexes |
+| `librt` | POSIX | `shm_open` realtime extensions |
+| `libsqlite3-dev` | 3.x | Embedded database |
 
 ---
 
 ## Build & Run
 
 ```bash
-# Clone the repo
-git clone https://github.com/YOUR_USERNAME/txn_system.git
-cd txn_system
+# 1. Clone
+git clone https://github.com/MR-Shibi/multi-threaded-transaction-processing-system.git
+cd multi-threaded-transaction-processing-system
 
-# Build
+# 2. Build
 make
 
-# Run (automatic + manual input)
-./txn_system
+# 3. Run
+./txn_system              # automatic + manual (default)
+./txn_system --auto       # automatic producers only
+./txn_system --manual     # guided wizard only
+./txn_system --both       # both modes explicitly
+./txn_system --help       # show usage
 
-# Run automatic producers only
-./txn_system --auto
-
-# Run manual keyboard input only
-./txn_system --manual
-
-# Stop gracefully
-Ctrl+C
+# 4. Stop
+Ctrl+C                    # triggers graceful ordered shutdown
 ```
 
 ---
 
-## Running Modes
+## Manual Mode — Step-by-Step Wizard
 
-### Automatic Mode (`--auto`)
-Three producer threads generate transactions continuously at different speeds:
-- **SLOW** — one transaction every 800ms, simulates light load
-- **FAST** — one transaction every 200ms, simulates heavy load
-- **BURST** — 4 rapid transactions then 2-second pause, simulates batch processing
+When running `--manual` or `--both`, the wizard guides you through each transaction:
 
-### Manual Mode (`--manual`)
-You type transactions at the `txn>` prompt while the system runs:
+**STEP 1 — Select User** (numbered list, no typing names)
 ```
-txn> 3 250 WITHDRAWAL     # user 3, $250, withdrawal
-txn> 2 500 DEPOSIT        # user 2, $500, deposit
-txn> 5 100 TRANSFER       # user 5 — REJECTED (no active session)
-txn> quit                 # stop manual input
+╔═══════════ STEP 1 of 3 — Select User ════════════╗
+║  [1]  Alice       $1,500         SESSION ACTIVE  ║
+║  [2]  Bob         $2,200         SESSION ACTIVE  ║
+║  [3]  Charlie     $800           SESSION ACTIVE  ║
+║  [4]  Diana       $3,100         SESSION ACTIVE  ║
+║  [5]  Eve         $500           NO SESSION      ║
+╚══════════════════════════════════════════════════╝
+Select user [1-5] or 'q' to quit:
 ```
 
-### Both Modes (default)
-Automatic producers run in the background while you inject manual transactions.
+**STEP 2 — Select Type** (numbered menu, no spelling errors possible)
+```
+╔══════════ STEP 2 of 3 — Transaction Type ════════╗
+║              User: [3] Charlie                   ║
+║  [1]  DEPOSIT      Add money to account          ║
+║  [2]  WITHDRAWAL   Take money from account       ║
+║  [3]  TRANSFER     Send money (deducts balance)  ║
+╚══════════════════════════════════════════════════╝
+Select type [1-3]:
+```
+
+**STEP 3 — Enter Amount** (shows balance and limit)
+```
+╔════════════ STEP 3 of 3 — Enter Amount ══════════╗
+║  User: [3] Charlie   Type: WITHDRAWAL            ║
+║  Current Balance: $800.00                        ║
+║  Max you can enter: $800.00                      ║
+╚══════════════════════════════════════════════════╝
+Enter amount:
+```
+
+**STEP 4 — Confirm** then green **QUEUED** success panel.
+
+> The monitor thread **automatically pauses** during every prompt so it never interrupts your input. Each step completes fully before the next one appears.
 
 ---
 
 ## Test Scenarios
 
-| Input | Expected Result |
-|---|---|
-| `5 200 WITHDRAWAL` | **REJECTED** — user 5 has no active session |
-| `2 9999 WITHDRAWAL` | **REJECTED** — insufficient funds (balance $2200) |
-| `3 100 DEPOSIT` | **VALID** → committed to SQLite |
-| `1 500 TRANSFER` | **VALID** → committed, balance updated |
+| Input | Expected Result | Reason |
+|---|---|---|
+| User `5`, any type, any amount | **REJECTED** | Eve has no active session |
+| User `2`, WITHDRAWAL, `$9999` | **REJECTED** | Bob's balance is $2,200 |
+| User `1`, DEPOSIT, `$500` | **VALID → COMMITTED** | Alice has active session, deposits always pass |
+| User `3`, WITHDRAWAL, `$100` | **VALID → COMMITTED** | Charlie has session, balance $800 > $100 |
+| User `4`, TRANSFER, `$5000` | **REJECTED** | Diana's balance is $3,100 < $5,000 |
 
 ---
 
@@ -206,10 +306,11 @@ CREATE TABLE sessions (
     session_id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER NOT NULL REFERENCES users(user_id),
     is_active  INTEGER NOT NULL DEFAULT 1,
-    expires_at INTEGER NOT NULL   -- Unix timestamp
+    expires_at INTEGER NOT NULL        -- Unix timestamp
 );
 
--- Audit log: every transaction that entered the system
+-- Audit log: EVERY transaction that entered Buffer 1
+-- Status: PENDING → PROCESSING → DONE | REJECTED
 CREATE TABLE raw_transactions (
     txn_id     INTEGER PRIMARY KEY,
     user_id    INTEGER NOT NULL,
@@ -218,7 +319,6 @@ CREATE TABLE raw_transactions (
     status     TEXT    NOT NULL DEFAULT 'PENDING',
     created_at INTEGER NOT NULL
 );
--- status: PENDING → PROCESSING → DONE | REJECTED
 
 -- Final record: only successfully committed transactions
 CREATE TABLE transactions (
@@ -233,7 +333,7 @@ CREATE TABLE transactions (
 );
 ```
 
-### Seeded Users
+### Seeded Test Users
 
 | ID | Name | Balance | Session |
 |---|---|---|---|
@@ -241,21 +341,7 @@ CREATE TABLE transactions (
 | 2 | Bob | $2,200 | ✅ Active |
 | 3 | Charlie | $800 | ✅ Active |
 | 4 | Diana | $3,100 | ✅ Active |
-| 5 | Eve | $500 | ❌ Logged out |
-
----
-
-## Inspect Results
-
-```bash
-# Open database after a run
-make db
-
-# Useful queries
-SELECT user_id, name, balance FROM users;
-SELECT status, COUNT(*) FROM raw_transactions GROUP BY status;
-SELECT txn_id, user_id, amount, type, balance_after FROM transactions;
-```
+| 5 | Eve | $500 | ❌ No session — always rejected |
 
 ---
 
@@ -266,44 +352,102 @@ make              # build the binary
 make run          # build and run (--both mode)
 make auto         # build and run (--auto mode)
 make manual       # build and run (--manual mode)
-make db           # open SQLite shell on transactions.db
-make clean        # remove compiled files, database, runtime files
-make help         # show all targets
+make db           # open SQLite3 shell on transactions.db
+make clean        # remove all compiled files, database, runtime files
+make help         # show all targets with descriptions
 ```
 
 ---
 
-## Shutdown Order
+## Inspect Results
 
-The graceful shutdown sequence is strictly ordered to prevent data loss:
+```bash
+# After any run:
+make db
+
+# Inside sqlite3 shell:
+SELECT user_id, name, balance FROM users;
+SELECT status, COUNT(*) FROM raw_transactions GROUP BY status;
+SELECT txn_id, user_id, amount, type, balance_after FROM transactions;
+.quit
+```
+
+---
+
+## Graceful Shutdown Sequence
+
+The shutdown order is strictly enforced to guarantee zero data loss:
 
 ```
 Ctrl+C
-  → signal_handler: g_running = false
-  → fclose(stdin)         unblocks manual producer
-  → join producers        all transactions enqueued
-  → join validators       all queries written to pipe
-  → close write_fd        EOF signal to updaters
-  → join updaters         all queries committed to SQLite
-  → join monitor          final snapshot printed
-  → logger_shutdown()     queue drained, logger exits
-  → shm_buffer_destroy()  shared memory unlinked
-  → fifo_destroy()        named pipe removed
-  → db_close()            SQLite connection closed
-  → print_final_report()  summary printed to terminal
+  ↓
+signal_handler()              sets g_running = false  (async-signal-safe)
+  ↓
+fclose(stdin)                 unblocks manual wizard's fgets()
+  ↓
+pthread_join(producers)       wait — all transactions enqueued to SHM
+  ↓
+pthread_join(validators)      wait — all queries written to Named Pipe
+  ↓
+fifo_close(write_fd)          EOF signal sent to DB Updater threads
+  ↓
+pthread_join(updaters)        wait — all queries committed to SQLite
+  ↓
+pthread_join(monitor)         final snapshot printed
+  ↓
+logger_shutdown()             queue fully drained, logger thread exits
+  ↓
+shm_buffer_destroy()          munmap + shm_unlink — /dev/shm cleaned up
+fifo_destroy()                unlink — /tmp/txn_query_pipe removed
+db_close()                    sqlite3_close()
+  ↓
+print_final_report()          bordered summary with PASS/FAIL checks
 ```
+
+> Reversing any step causes either deadlock, data loss, or a crash. The order above is the only correct sequence.
 
 ---
 
-## Course Information
+## Thread Color Identity
 
-- **Course:** Operating Systems
-- **Institution:** FAST University
-- **Instructor:** Sir Minhal Raza
-- **Students:** Huzaifa Ahmed Bari (24k-0847) · Shoaib Hayat (24k-1028)
+Each thread type has a permanent color in all log output:
+
+| Thread | Color | Symbol |
+|---|---|---|
+| PRODUCER | Cyan | `>` |
+| VALIDATOR | Yellow | `#` |
+| UPDATER | Green | `+` |
+| MONITOR | Magenta | `o` |
+| SYSTEM | White | `.` |
+| REJECTED messages | Red | — |
+| VALID / COMMITTED | Green | — |
+
+---
+
+## Common Issues
+
+| Problem | Cause | Fix |
+|---|---|---|
+| `make: *** No rule to make target` | `sqlite3_stub.c` missing | Run `sudo apt-get install libsqlite3-dev` |
+| `fatal error: sqlite3.h not found` | Dev package not installed | `sudo apt-get install libsqlite3-dev` |
+| `Permission denied` on `/dev/shm/` | Previous crash left segment | `rm /dev/shm/txn_shared_buffer` |
+| `Address already in use` on pipe | Previous crash left FIFO | `rm /tmp/txn_query_pipe` |
+| `make clean` then rebuild | Stale `.o` files | Always do `make clean && make` after file changes |
 
 ---
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for full text.
+
+---
+
+## Course Information
+
+| | |
+|---|---|
+| **University** | FAST University |
+| **Course** | Operating Systems |
+| **Instructor** | Sir Minhal Raza |
+| **Student 1** | Huzaifa Ahmed Bari — Roll No: 24k-0847 |
+| **Student 2** | Shoaib Hayat — Roll No: 24k-1028 |
