@@ -298,7 +298,7 @@ Ctrl+C
 ## Course Information
 
 - **Course:** Operating Systems
-- **Institution:** IQRA University
+- **Institution:** FAST University
 - **Instructor:** Sir Minhal Raza
 - **Students:** Huzaifa Ahmed Bari (24k-0847) · Shoaib Hayat (24k-1028)
 
