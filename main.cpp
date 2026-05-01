@@ -177,6 +177,9 @@
 // ============================================================
 //  main.cpp — Phase 10 Final with Rich Terminal UI
 // ============================================================
+// ============================================================
+//  main.cpp — Phase 10 Final with Rich Terminal UI
+// ============================================================
 
 #include <cstdio>
 #include <cstring>
@@ -202,6 +205,7 @@
 // ── Global state ─────────────────────────────────────────────
 std::atomic<bool> g_running(true);
 std::atomic<int>  g_next_txn_id(1);
+std::atomic<bool> g_input_active(false);
 
 // ============================================================
 //  Signal handler — async-signal-safe only

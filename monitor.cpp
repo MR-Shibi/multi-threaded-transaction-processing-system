@@ -9,6 +9,13 @@
 // ============================================================
 //  monitor.cpp — Updated with rich UI snapshot panels
 // ============================================================
+// ============================================================
+//  monitor.cpp — Monitor Thread
+//
+//  Respects g_input_active: when the manual wizard is waiting
+//  for a keypress, the monitor skips that snapshot cycle
+//  entirely so it never clobbers the input prompt.
+// ============================================================
 
 #include "monitor.h"
 #include "shared_buffer.h"
@@ -31,18 +38,27 @@ void* monitor_thread(void* args) {
 
     logger_log(ThreadType::MONITOR, id,
         "Started. Reporting every "
-        + std::to_string(MONITOR_INTERVAL_SEC) + "s.");
+        + std::to_string(MONITOR_INTERVAL_SEC)
+        + "s (pauses during manual input).");
 
     int    prev_committed = 0;
     time_t prev_time      = time(nullptr);
     int    snapshot_num   = 0;
 
     do {
+        // Sleep for the reporting interval
         sleep(MONITOR_INTERVAL_SEC);
+
+        // ── KEY FIX: skip if user is mid-input ───────────────
+        // If the wizard is currently waiting for a keypress,
+        // do NOT print anything — it would overwrite the prompt
+        // and confuse the user. Just skip this cycle silently.
+        if (g_input_active.load()) {
+            continue;
+        }
 
         snapshot_num++;
 
-        // ── Read all counts ───────────────────────────────────
         int done       = db_count_raw_by_status("DONE");
         int rejected   = db_count_raw_by_status("REJECTED");
         int pending    = db_count_raw_by_status("PENDING");
@@ -50,7 +66,6 @@ void* monitor_thread(void* args) {
         int committed  = db_count_committed();
         int buf_count  = shm_buffer_count(buf);
 
-        // ── Compute throughput ────────────────────────────────
         time_t now     = time(nullptr);
         double elapsed = difftime(now, prev_time);
         double tps     = (elapsed > 0)
@@ -59,9 +74,7 @@ void* monitor_thread(void* args) {
         prev_committed = committed;
         prev_time      = now;
 
-        // ── Draw rich bordered snapshot panel ─────────────────
-        // This prints directly — monitor "owns" its panel output.
-        // All other output still goes through logger_log().
+        // Print snapshot only when user is NOT typing
         ui_print_monitor_snapshot(
             snapshot_num,
             buf_count, SHARED_BUFFER_SIZE,
@@ -69,9 +82,6 @@ void* monitor_thread(void* args) {
             committed, tps
         );
 
-        // Also send a brief summary to the logger queue
-        // so it appears in the correct chronological order
-        // among other thread messages.
         logger_log(ThreadType::MONITOR, id,
             "Snapshot #" + std::to_string(snapshot_num)
             + " | DONE:" + std::to_string(done)
@@ -81,20 +91,21 @@ void* monitor_thread(void* args) {
 
     } while (g_running.load());
 
-    // ── Final snapshot at shutdown ────────────────────────────
-    int final_done      = db_count_raw_by_status("DONE");
-    int final_rejected  = db_count_raw_by_status("REJECTED");
-    int final_pending   = db_count_raw_by_status("PENDING");
-    int final_proc      = db_count_raw_by_status("PROCESSING");
-    int final_committed = db_count_committed();
-    int final_buf       = shm_buffer_count(buf);
+    // Final snapshot at shutdown (only if not mid-input)
+    if (!g_input_active.load()) {
+        int fd = db_count_raw_by_status("DONE");
+        int fr = db_count_raw_by_status("REJECTED");
+        int fp = db_count_raw_by_status("PENDING");
+        int fc = db_count_raw_by_status("PROCESSING");
+        int fm = db_count_committed();
+        int fb = shm_buffer_count(buf);
 
-    ui_print_monitor_snapshot(
-        snapshot_num + 1,
-        final_buf, SHARED_BUFFER_SIZE,
-        final_done, final_rejected, final_pending, final_proc,
-        final_committed, 0.0
-    );
+        ui_print_monitor_snapshot(
+            snapshot_num + 1,
+            fb, SHARED_BUFFER_SIZE,
+            fd, fr, fp, fc, fm, 0.0
+        );
+    }
 
     logger_log(ThreadType::MONITOR, id,
         "Final snapshot complete. Monitor thread exiting.");
