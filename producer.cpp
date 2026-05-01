@@ -30,6 +30,16 @@
 //  The wizard also completes ONE full transaction before
 //  looping — it never moves to Step 2 while still on Step 1.
 // ============================================================
+// ============================================================
+//  producer.cpp
+//
+//  Manual wizard sets g_input_active = true before every
+//  prompt and false after reading the line. This tells the
+//  monitor to skip printing while the user is typing.
+//
+//  The wizard also completes ONE full transaction before
+//  looping — it never moves to Step 2 while still on Step 1.
+// ============================================================
 
 #include "producer.h"
 #include "transaction.h"
@@ -115,10 +125,17 @@ static bool wizard_read_line(const char* prompt,
     // Signal monitor it can resume
     g_input_active.store(false);
 
+    // If fgets failed (stdin closed by signal) → shutdown
     if (!ok) return false;
 
-    // Strip newline and leading/trailing spaces
+    // Strip newline
     buf[strcspn(buf, "\n")] = '\0';
+
+    // If g_running went false while we were blocked, treat as quit
+    // This suppresses the spurious error message on Ctrl+C
+    if (!g_running.load() && strlen(buf) == 0) return false;
+
+    // Strip leading/trailing spaces
     int start = 0;
     while (buf[start] == ' ') start++;
     if (start > 0) memmove(buf, buf + start,
