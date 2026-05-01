@@ -19,7 +19,7 @@
 
 // Path to the SQLite database file on disk.
 // Created automatically on first run. Persists across runs.
-static const char* DB_FILE = "transactions.db";
+static constexpr const char* DB_FILE = "transactions.db";
 
 // ── Lifecycle ────────────────────────────────────────────────
 

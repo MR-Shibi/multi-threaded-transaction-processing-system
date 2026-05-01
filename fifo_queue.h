@@ -24,7 +24,7 @@
 // Path of the FIFO in the filesystem.
 // mkfifo() creates a special file here. It looks like a regular
 // file but behaves like a pipe — reading blocks until data arrives.
-static const char* FIFO_PATH = "/tmp/txn_query_pipe";
+static constexpr const char* FIFO_PATH = "/tmp/txn_query_pipe";
 
 // Fixed message size in bytes.
 // All writes and reads use exactly this many bytes.

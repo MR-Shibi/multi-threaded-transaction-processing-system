@@ -11,7 +11,7 @@ A production-quality simulation of a banking transaction pipeline built entirely
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                   PRODUCER THREADS                          │
-│          SLOW  ·  FAST  ·  BURST  ·  MANUAL INPUT          │
+│          SLOW  ·  FAST  ·  BURST  ·  MANUAL INPUT           │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼

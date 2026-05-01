@@ -13,9 +13,6 @@
 //  are visually distinct. Input is guided and validated.
 // ============================================================
 
-#include <string>
-#include <cstdio>
-
 // ============================================================
 //  ANSI ESCAPE CODES
 //  These are standard terminal control sequences supported
@@ -23,18 +20,20 @@
 //  Format: \033[<code>m  where \033 is the ESC character.
 // ============================================================
 
-// ── Reset ────────────────────────────────────────────────────
-#define ANSI_RESET       "\033[0m"
+// ============================================================
+//  ui.h — Terminal UI System
+//  ANSI colors, bordered panels, step-by-step wizard input
+// ============================================================
 
-// ── Text styles ──────────────────────────────────────────────
+#include <string>
+#include <cstdio>
+
+// ── ANSI codes ───────────────────────────────────────────────
+#define ANSI_RESET       "\033[0m"
 #define ANSI_BOLD        "\033[1m"
 #define ANSI_DIM         "\033[2m"
-#define ANSI_ITALIC      "\033[3m"
 #define ANSI_UNDERLINE   "\033[4m"
-#define ANSI_BLINK       "\033[5m"
-#define ANSI_REVERSE     "\033[7m"
 
-// ── Foreground colors ────────────────────────────────────────
 #define ANSI_BLACK       "\033[30m"
 #define ANSI_RED         "\033[31m"
 #define ANSI_GREEN       "\033[32m"
@@ -44,7 +43,6 @@
 #define ANSI_CYAN        "\033[36m"
 #define ANSI_WHITE       "\033[37m"
 
-// ── Bright foreground colors ─────────────────────────────────
 #define ANSI_BR_BLACK    "\033[90m"
 #define ANSI_BR_RED      "\033[91m"
 #define ANSI_BR_GREEN    "\033[92m"
@@ -54,7 +52,6 @@
 #define ANSI_BR_CYAN     "\033[96m"
 #define ANSI_BR_WHITE    "\033[97m"
 
-// ── Background colors ────────────────────────────────────────
 #define ANSI_BG_BLACK    "\033[40m"
 #define ANSI_BG_RED      "\033[41m"
 #define ANSI_BG_GREEN    "\033[42m"
@@ -64,10 +61,7 @@
 #define ANSI_BG_CYAN     "\033[46m"
 #define ANSI_BG_WHITE    "\033[47m"
 
-// ── Thread-type color scheme ─────────────────────────────────
-// Each thread type has a unique color identity — consistent
-// throughout all log output so you can instantly identify
-// which component is speaking at a glance.
+// ── Thread color identity ────────────────────────────────────
 #define UI_COLOR_PRODUCER   ANSI_BR_CYAN
 #define UI_COLOR_VALIDATOR  ANSI_BR_YELLOW
 #define UI_COLOR_UPDATER    ANSI_BR_GREEN
@@ -77,10 +71,8 @@
 #define UI_COLOR_SUCCESS    ANSI_BR_GREEN
 #define UI_COLOR_WARNING    ANSI_BR_YELLOW
 #define UI_COLOR_DIM        ANSI_BR_BLACK
-#define UI_COLOR_HEADER     ANSI_BR_WHITE
 
-// ── Box-drawing characters (UTF-8) ───────────────────────────
-// Used to draw bordered panels.
+// ── Box drawing (UTF-8) ──────────────────────────────────────
 #define BOX_TL   "╔"
 #define BOX_TR   "╗"
 #define BOX_BL   "╚"
@@ -90,10 +82,7 @@
 #define BOX_ML   "╠"
 #define BOX_MR   "╣"
 #define BOX_MH   "═"
-#define BOX_TM   "╦"
-#define BOX_BM   "╩"
 
-// Thin box variants (for nested panels)
 #define THIN_TL  "┌"
 #define THIN_TR  "┐"
 #define THIN_BL  "└"
@@ -103,52 +92,73 @@
 #define THIN_ML  "├"
 #define THIN_MR  "┤"
 
-// Arrow symbols for pipeline flow
+// ── Symbols ──────────────────────────────────────────────────
 #define ARROW_DOWN  "  ▼  "
-#define ARROW_RIGHT " ──► "
 #define BULLET      " ●  "
 #define CHECK       " ✓  "
 #define CROSS       " ✗  "
 #define WARN        " ⚠  "
 #define INFO        " ℹ  "
-#define PIPE_SYM    " ║  "
 
 // ── Panel width ───────────────────────────────────────────────
-static const int UI_WIDTH = 64;  // total terminal width of panels
+static const int UI_WIDTH = 64;
 
 // ============================================================
 //  FUNCTION DECLARATIONS
 // ============================================================
 
-// ── Startup / shutdown visuals ───────────────────────────────
+// ── Startup / Shutdown ───────────────────────────────────────
 void ui_print_banner(bool auto_mode, bool manual_mode);
 void ui_print_shutdown_banner();
 void ui_print_final_report(int generated, int done, int rejected,
                            int pending, int processing, int committed);
 
-// ── Pipeline flow animation ───────────────────────────────────
-// Called between major state transitions in simulation mode.
-// Prints a colored arrow showing data moving between stages.
+// ── Step-by-step transaction wizard ─────────────────────────
+// Called in sequence by manual_producer_thread():
+//   1. ui_wizard_show_users()       → user picks 1-5
+//   2. ui_wizard_show_types()       → user picks 1-3
+//   3. ui_wizard_show_amount()      → user enters amount
+//   4. ui_wizard_show_confirm()     → user confirms or cancels
+//   5. ui_wizard_show_queued()      → success panel
+//      ui_wizard_show_cancelled()   → if user cancelled
+//      ui_wizard_warn_no_session()  → warning if user 5 chosen
+
+void ui_wizard_show_users();
+void ui_wizard_show_types(int user_id, const char* user_name);
+void ui_wizard_show_amount(int user_id, const char* user_name,
+                            const char* txn_type,
+                            double current_balance);
+void ui_wizard_warn_no_session(const char* user_name);
+void ui_wizard_show_confirm(int user_id, const char* user_name,
+                             const char* txn_type, double amount);
+void ui_wizard_show_queued(int txn_id, int user_id,
+                            const char* user_name,
+                            const char* txn_type, double amount);
+void ui_wizard_show_cancelled();
+void ui_wizard_prompt(const char* step_label);
+void ui_wizard_error(const char* msg);
+void ui_wizard_ask_another();
+
+// ── Legacy input functions (used by logger / other code) ────
+void ui_print_input_panel();
+void ui_print_input_prompt();
+void ui_print_input_error(const char* field, const char* reason);
+void ui_print_input_success(int txn_id, int user_id,
+                             double amount, const char* type);
+void ui_print_input_hint(const char* hint);
+
+// ── Pipeline transition animation ────────────────────────────
 void ui_animate_transition(const char* from_stage,
                            const char* to_stage,
                            const char* detail);
 
-// ── Manual input UI ──────────────────────────────────────────
-void ui_print_input_panel();          // draw the input help panel
-void ui_print_input_prompt();         // print the styled "txn>" prompt
-void ui_print_input_success(int txn_id, int user_id,
-                             double amount, const char* type);
-void ui_print_input_error(const char* field, const char* reason);
-void ui_print_input_hint(const char* hint);
-
-// ── Log line formatting ──────────────────────────────────────
-// Returns a fully formatted, colored log line ready for printf.
+// ── Log line formatter ────────────────────────────────────────
 std::string ui_format_log(const char* thread_type,
                            int         thread_num,
                            const char* message,
                            const char* timestamp);
 
-// ── Section headers ──────────────────────────────────────────
+// ── Section divider ──────────────────────────────────────────
 void ui_print_section(const char* title);
 
 // ── Monitor snapshot panel ────────────────────────────────────
@@ -158,17 +168,10 @@ void ui_print_monitor_snapshot(int snapshot_num,
                                 int pending, int processing,
                                 int committed, double tps);
 
-// ── Utility ──────────────────────────────────────────────────
-// Repeat a string n times into a std::string
+// ── Utilities ─────────────────────────────────────────────────
 std::string ui_repeat(const char* s, int n);
-
-// Build a fixed-width string (truncate or pad with spaces)
 std::string ui_fixed(const std::string& s, int width);
-
-// Print a full-width horizontal rule
 void ui_rule(const char* color = ANSI_BR_BLACK);
-
-// Clear current terminal line (for overwriting prompt)
 void ui_clear_line();
 
 #endif // UI_H

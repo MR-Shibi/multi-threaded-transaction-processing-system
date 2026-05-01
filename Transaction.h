@@ -9,16 +9,16 @@ static const int MAX_STATUS_LEN  = 16;
 static const int MAX_REASON_LEN  = 128;
 static const int MAX_QUERY_LEN   = 512;
 
-static const char* TYPE_DEPOSIT    = "DEPOSIT";
-static const char* TYPE_WITHDRAWAL = "WITHDRAWAL";
-static const char* TYPE_TRANSFER   = "TRANSFER";
+static constexpr const char* TYPE_DEPOSIT    = "DEPOSIT";
+static constexpr const char* TYPE_WITHDRAWAL = "WITHDRAWAL";
+static constexpr const char* TYPE_TRANSFER   = "TRANSFER";
 
-static const char* STATUS_PENDING    = "PENDING";
-static const char* STATUS_PROCESSING = "PROCESSING";
-static const char* STATUS_VALID      = "VALID";
-static const char* STATUS_REJECTED   = "REJECTED";
-static const char* STATUS_PAID       = "PAID";
-static const char* STATUS_FAILED     = "FAILED";
+static constexpr const char* STATUS_PENDING    = "PENDING";
+static constexpr const char* STATUS_PROCESSING = "PROCESSING";
+static constexpr const char* STATUS_VALID      = "VALID";
+static constexpr const char* STATUS_REJECTED   = "REJECTED";
+static constexpr const char* STATUS_PAID       = "PAID";
+static constexpr const char* STATUS_FAILED     = "FAILED";
 
 struct Transaction {
     // ── Producer fields ──────────────────────────────────────

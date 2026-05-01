@@ -13,6 +13,18 @@
 //    1. POSIX Shared Memory Buffer (shm_buffer_produce)
 //    2. raw_transactions table in SQLite (db_insert_raw_transaction)
 // ============================================================
+// ============================================================
+//  producer.h
+//  PRODUCER THREADS — Entry point of the pipeline
+//
+//  Two modes run simultaneously:
+//    Automatic: 3 threads generating transactions at different speeds
+//    Manual:    1 thread reading from keyboard input
+//
+//  Both modes write to:
+//    1. POSIX Shared Memory Buffer (shm_buffer_produce)
+//    2. raw_transactions table in SQLite (db_insert_raw_transaction)
+// ============================================================
 
 #include "shared_buffer.h"
 

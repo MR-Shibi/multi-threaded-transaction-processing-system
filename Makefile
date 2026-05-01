@@ -32,7 +32,7 @@
 # ============================================================
 
 CXX      := g++
-CXXFLAGS := -std=c++17 -Wall -Wextra -g -pthread
+CXXFLAGS := -std=c++17 -Wall -Wextra -g -pthread -Wno-format-extra-args
 TARGET   := txn_system
 LDFLAGS  := -lpthread -lrt -lsqlite3
 

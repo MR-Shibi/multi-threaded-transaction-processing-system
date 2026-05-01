@@ -83,10 +83,10 @@ SharedMemoryBuffer* shm_buffer_create() {
     // ptr points to raw bytes. We tell the compiler to treat
     // those bytes as a SharedMemoryBuffer. This is the core trick
     // of shared memory — we impose our struct layout on raw RAM.
-    SharedMemoryBuffer* buf = static_cast<SharedMemoryBuffer*>(ptr);
+    // SharedMemoryBuffer* buf = static_cast<SharedMemoryBuffer*>(ptr);
 
     // Zero out the entire struct first to clear any stale data.
-    memset(buf, 0, sizeof(SharedMemoryBuffer));
+    SharedMemoryBuffer* buf = new (ptr) SharedMemoryBuffer{};
 
     // ── Step 5: Initialize the semaphores ────────────────────
     // sem_init() initializes an unnamed semaphore in-place

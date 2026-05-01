@@ -55,7 +55,7 @@ struct SharedMemoryBuffer {
 
 // Name of the shared memory segment in the kernel's namespace.
 // You can see it as a file at /dev/shm/txn_shared_buffer on Linux.
-static const char* SHM_NAME = "/txn_shared_buffer";
+static constexpr const char* SHM_NAME = "/txn_shared_buffer";
 
 // ── Public API ───────────────────────────────────────────────
 
