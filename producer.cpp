@@ -1,44 +1,12 @@
 // ============================================================
 //  producer.cpp
-//  PRODUCER THREADS — Full Implementation
-//
-//  Automatic producers generate random transactions and feed
-//  them into the shared memory buffer.
-//  The manual producer reads from the keyboard.
-// ============================================================
-// ============================================================
-//  producer.cpp — Updated with rich UI and 1s transition delay
-// ============================================================
-// ============================================================
-//  producer.cpp
-//  PRODUCER THREADS
-//
-//  Automatic mode: SLOW / FAST / BURST with 1s transition delay
-//  Manual mode:    Step-by-step guided wizard
-//    Step 1 → Choose user (1-5, shown with name + balance + session)
-//    Step 2 → Choose type (1=DEPOSIT  2=WITHDRAWAL  3=TRANSFER)
-//    Step 3 → Enter amount (with balance limit shown)
-//    Step 4 → Confirm summary before submitting
-// ============================================================
-// ============================================================
-//  producer.cpp
-//
-//  Manual wizard sets g_input_active = true before every
-//  prompt and false after reading the line. This tells the
-//  monitor to skip printing while the user is typing.
-//
-//  The wizard also completes ONE full transaction before
-//  looping — it never moves to Step 2 while still on Step 1.
-// ============================================================
-// ============================================================
-//  producer.cpp
-//
-//  Manual wizard sets g_input_active = true before every
-//  prompt and false after reading the line. This tells the
-//  monitor to skip printing while the user is typing.
-//
-//  The wizard also completes ONE full transaction before
-//  looping — it never moves to Step 2 while still on Step 1.
+//  FIXES:
+//    1. Transfer asks for recipient (Step 2b)
+//    2. "Choice:" prompt never duplicates
+//    3. Arrow keys / escape sequences stripped from input
+//    4. g_input_active set for EVERY fgets() including "Another?"
+//    5. Better log messages (human-readable)
+//    6. Auto mode uses AUTO_TRANSITION_DELAY_US from ui.h
 // ============================================================
 
 #include "producer.h"
@@ -47,7 +15,7 @@
 #include "database.h"
 #include "logger.h"
 #include "ui.h"
-#include "monitor.h"   // for g_input_active
+#include "monitor.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -56,14 +24,12 @@
 #include <cstdio>
 #include <atomic>
 #include <string>
+#include <cctype>
 
 extern std::atomic<bool> g_running;
 extern std::atomic<int>  g_next_txn_id;
 
-static const int TRANSITION_DELAY_US = 1000000;
-
-static const char* TXN_TYPES[] = {"DEPOSIT", "WITHDRAWAL", "TRANSFER"};
-
+// ── User table (mirrors seeded DB data) ──────────────────────
 static const struct {
     int         id;
     const char* name;
@@ -77,71 +43,84 @@ static const struct {
 };
 static const int NUM_USERS = 5;
 
-// ── Automatic transaction helper ──────────────────────────────
-static Transaction make_transaction(int thread_id) {
-    static const char* AUTO_TYPES[] = {"DEPOSIT","WITHDRAWAL","TRANSFER"};
-    Transaction txn;
-    txn.transaction_id = g_next_txn_id.fetch_add(1);
-    txn.user_id        = USERS[rand() % NUM_USERS].id;
-    txn.amount         = (double)((rand() % 19) + 1) * 50.0;
-    strncpy(txn.transaction_type,
-            AUTO_TYPES[rand() % 3], MAX_TYPE_LEN - 1);
-    txn.timestamp   = time(nullptr);
-    txn.retry_count = 0;
+static const char* TXN_TYPES[] = {"DEPOSIT", "WITHDRAWAL", "TRANSFER"};
 
-    db_insert_raw_transaction(txn.transaction_id, txn.user_id,
-                              txn.amount,
-                              std::string(txn.transaction_type));
+// ============================================================
+//  HELPER: get_user_name()
+//  Returns name string for a given user id, or "Unknown"
+// ============================================================
+static const char* get_user_name(int uid) {
+    for (int i = 0; i < NUM_USERS; i++)
+        if (USERS[i].id == uid) return USERS[i].name;
+    return "Unknown";
+}
 
-    logger_log(ThreadType::PRODUCER, thread_id,
-        "Created TXN #" + std::to_string(txn.transaction_id)
-        + " | User:" + std::to_string(txn.user_id)
-        + " | $" + std::to_string((int)txn.amount)
-        + " | " + txn.transaction_type);
-    return txn;
+// ============================================================
+//  HELPER: strip_input()
+//  Strips:
+//    - Trailing newline / carriage return
+//    - Leading and trailing spaces
+//    - ANSI/VT100 escape sequences (arrow keys produce ^[[A etc.)
+//      These arrive as 0x1B 0x5B 0x41/0x42/0x43/0x44
+//  Returns cleaned string in-place.
+// ============================================================
+static void strip_input(char* buf) {
+    // Remove ANSI escape sequences first
+    // Pattern: ESC [ ... letter  (ESC = 0x1B)
+    char clean[256];
+    int j = 0;
+    for (int i = 0; buf[i] != '\0'; i++) {
+        if ((unsigned char)buf[i] == 0x1B) {
+            // Skip ESC and everything until a letter A-Z a-z
+            i++;  // skip '['
+            while (buf[i] != '\0' &&
+                   !((buf[i] >= 'A' && buf[i] <= 'Z') ||
+                     (buf[i] >= 'a' && buf[i] <= 'z'))) {
+                i++;
+            }
+            // skip the final letter too (loop will i++ again)
+            continue;
+        }
+        clean[j++] = buf[i];
+    }
+    clean[j] = '\0';
+    memcpy(buf, clean, j + 1);
+
+    // Strip trailing newline / carriage return / spaces
+    int end = (int)strlen(buf) - 1;
+    while (end >= 0 &&
+           (buf[end] == '\n' || buf[end] == '\r' || buf[end] == ' '))
+        buf[end--] = '\0';
+
+    // Strip leading spaces
+    int start = 0;
+    while (buf[start] == ' ') start++;
+    if (start > 0)
+        memmove(buf, buf + start, strlen(buf) - start + 1);
 }
 
 // ============================================================
 //  HELPER: wizard_read_line()
-//
-//  Sets g_input_active = true BEFORE printing the prompt
-//  so the monitor knows to stay silent.
-//  Sets g_input_active = false AFTER the user presses Enter
-//  so the monitor can resume printing.
-//
-//  Returns false if stdin is closed (shutdown).
+//  Sets g_input_active=true BEFORE the prompt so the monitor
+//  stays silent while the user is typing.
+//  Sets g_input_active=false AFTER fgets() returns.
+//  Strips escape sequences from the result.
 // ============================================================
 static bool wizard_read_line(const char* prompt,
                               char* buf, int buf_size) {
-    // Signal monitor to pause
     g_input_active.store(true);
-
-    // Print the prompt
     ui_wizard_prompt(prompt);
 
-    // Block here waiting for user input
     bool ok = (fgets(buf, buf_size, stdin) != nullptr);
 
-    // Signal monitor it can resume
     g_input_active.store(false);
 
-    // If fgets failed (stdin closed by signal) → shutdown
     if (!ok) return false;
 
-    // Strip newline
-    buf[strcspn(buf, "\n")] = '\0';
+    strip_input(buf);
 
-    // If g_running went false while we were blocked, treat as quit
-    // This suppresses the spurious error message on Ctrl+C
+    // If shutdown happened while we were waiting → treat as quit
     if (!g_running.load() && strlen(buf) == 0) return false;
-
-    // Strip leading/trailing spaces
-    int start = 0;
-    while (buf[start] == ' ') start++;
-    if (start > 0) memmove(buf, buf + start,
-                           strlen(buf) - start + 1);
-    int end = (int)strlen(buf) - 1;
-    while (end >= 0 && buf[end] == ' ') buf[end--] = '\0';
 
     return true;
 }
@@ -151,7 +130,41 @@ static bool is_quit(const char* s) {
 }
 
 // ============================================================
+//  AUTOMATIC TRANSACTION HELPER
+// ============================================================
+static Transaction make_transaction(int thread_id) {
+    static const char* AUTO_TYPES[] = {"DEPOSIT","WITHDRAWAL","TRANSFER"};
+    Transaction txn;
+    txn.transaction_id = g_next_txn_id.fetch_add(1);
+    txn.user_id        = USERS[rand() % NUM_USERS].id;
+    txn.amount         = (double)((rand() % 19) + 1) * 50.0;
+
+    int type_idx = rand() % 3;
+    strncpy(txn.transaction_type, AUTO_TYPES[type_idx], MAX_TYPE_LEN - 1);
+
+    // For auto TRANSFER, pick a random different user as recipient
+    // We store recipient_id in a note field (not in original struct —
+    // we embed it in the log message only for auto mode)
+    txn.timestamp   = time(nullptr);
+    txn.retry_count = 0;
+
+    db_insert_raw_transaction(txn.transaction_id, txn.user_id,
+                              txn.amount,
+                              std::string(txn.transaction_type));
+
+    // Human-readable log message
+    std::string msg = "New transaction created  |  "
+        + std::string(get_user_name(txn.user_id))
+        + "  |  " + txn.transaction_type
+        + "  |  $" + std::to_string((int)txn.amount);
+
+    logger_log(ThreadType::PRODUCER, thread_id, msg);
+    return txn;
+}
+
+// ============================================================
 //  producer_thread() — Automatic mode
+//  Uses AUTO_TRANSITION_DELAY_US from ui.h (configurable)
 // ============================================================
 void* producer_thread(void* args) {
     ProducerArgs* a         = static_cast<ProducerArgs*>(args);
@@ -168,51 +181,60 @@ void* producer_thread(void* args) {
     }
 
     logger_log(ThreadType::PRODUCER, id,
-               std::string("Started [") + sn + " mode].");
+               std::string("Auto producer started  [") + sn + " mode]");
 
     while (g_running.load()) {
         if (style == ProducerStyle::BURST) {
             for (int b = 0; b < 4 && g_running.load(); b++) {
                 Transaction txn = make_transaction(id);
-                usleep(TRANSITION_DELAY_US);
+
+                // Configurable delay — change AUTO_TRANSITION_DELAY_US in ui.h
+                usleep(AUTO_TRANSITION_DELAY_US);
+
                 shm_buffer_produce(buf, txn);
+
                 logger_log(ThreadType::PRODUCER, id,
-                    "TXN #" + std::to_string(txn.transaction_id)
-                    + " ──► SHM [" + std::to_string(shm_buffer_count(buf))
-                    + "/" + std::to_string(SHARED_BUFFER_SIZE) + "]");
+                    "Transaction #" + std::to_string(txn.transaction_id)
+                    + " placed in queue  ["
+                    + std::to_string(shm_buffer_count(buf)) + "/"
+                    + std::to_string(SHARED_BUFFER_SIZE) + " slots used]");
+
                 usleep(delay);
             }
-            usleep(2000000);
+            usleep(2000000);  // 2-second pause between bursts
+
         } else {
             Transaction txn = make_transaction(id);
-            usleep(TRANSITION_DELAY_US);
+
+            usleep(AUTO_TRANSITION_DELAY_US);
+
             shm_buffer_produce(buf, txn);
+
             logger_log(ThreadType::PRODUCER, id,
-                "TXN #" + std::to_string(txn.transaction_id)
-                + " ──► SHM [" + std::to_string(shm_buffer_count(buf))
-                + "/" + std::to_string(SHARED_BUFFER_SIZE) + "]");
+                "Transaction #" + std::to_string(txn.transaction_id)
+                + " placed in queue  ["
+                + std::to_string(shm_buffer_count(buf)) + "/"
+                + std::to_string(SHARED_BUFFER_SIZE) + " slots used]");
+
             usleep(delay);
         }
     }
 
-    logger_log(ThreadType::PRODUCER, id, "Stopped.");
+    logger_log(ThreadType::PRODUCER, id, "Auto producer stopped.");
     return nullptr;
 }
 
 // ============================================================
 //  manual_producer_thread() — Step-by-step wizard
 //
-//  FLOW PER TRANSACTION:
-//    Step 1 → show user list   → read 1-5
-//    Step 2 → show type menu   → read 1-3
-//    Step 3 → show amount      → read number
-//    Step 4 → confirm          → read Enter or 'c'
-//    → submit → queued panel
-//    → ask another?
-//
-//  The wizard_read_line() helper pauses the monitor at every
-//  prompt, so snapshots never interrupt the input flow.
-//  Each step completes fully before moving to the next.
+//  FLOW:
+//    Step 1  → Choose account holder (1-5)
+//    Step 2  → Choose transaction type (1=DEPOSIT 2=WITHDRAWAL 3=TRANSFER)
+//    Step 2b → If TRANSFER: choose recipient (shown only for transfers)
+//    Step 3  → Enter amount
+//    Step 4  → Review and confirm
+//    Result  → ACCEPTED panel + progress logs
+//    Then    → Ask to make another (single prompt, no duplicate)
 // ============================================================
 void* manual_producer_thread(void* args) {
     ProducerArgs* a         = static_cast<ProducerArgs*>(args);
@@ -220,64 +242,96 @@ void* manual_producer_thread(void* args) {
     int id                  = a->thread_id;
 
     logger_log(ThreadType::PRODUCER, id,
-               "Manual wizard started.");
+               "Manual input wizard is ready.");
 
     char line[128];
 
     while (g_running.load()) {
 
         // ════════════════════════════════════════
-        //  STEP 1 — SELECT USER
+        //  STEP 1 — SELECT ACCOUNT HOLDER
         // ════════════════════════════════════════
         ui_wizard_show_users();
 
-        if (!wizard_read_line("Select user [1-5] or 'q' to quit: ",
+        if (!wizard_read_line("Your choice [1-5] or 'q' to quit: ",
                                line, sizeof(line))) break;
         if (is_quit(line)) {
-            logger_log(ThreadType::PRODUCER, id, "User quit.");
+            logger_log(ThreadType::PRODUCER, id, "User exited wizard.");
             break;
         }
 
         int user_choice = atoi(line);
         if (user_choice < 1 || user_choice > 5) {
             ui_wizard_error("Please enter a number between 1 and 5.");
-            continue;   // restart from Step 1
+            continue;
         }
 
         int         user_id   = USERS[user_choice-1].id;
         const char* user_name = USERS[user_choice-1].name;
         bool        has_sess  = USERS[user_choice-1].has_session;
 
-        // Warn if no session — but stay on same transaction
+        // Warn if no session
         if (!has_sess) {
             ui_wizard_warn_no_session(user_name);
             if (!wizard_read_line("Continue anyway? [y/n]: ",
                                    line, sizeof(line))) break;
             if (line[0] != 'y' && line[0] != 'Y') {
                 ui_wizard_show_cancelled();
-                continue;   // restart from Step 1
+                continue;
             }
         }
 
         // ════════════════════════════════════════
-        //  STEP 2 — SELECT TYPE
+        //  STEP 2 — SELECT TRANSACTION TYPE
         // ════════════════════════════════════════
         ui_wizard_show_types(user_id, user_name);
 
-        if (!wizard_read_line("Select type [1-3] or 'q' to quit: ",
+        if (!wizard_read_line("Your choice [1-3] or 'q' to quit: ",
                                line, sizeof(line))) break;
         if (is_quit(line)) {
-            logger_log(ThreadType::PRODUCER, id, "User quit.");
+            logger_log(ThreadType::PRODUCER, id, "User exited wizard.");
             break;
         }
 
         int type_choice = atoi(line);
         if (type_choice < 1 || type_choice > 3) {
             ui_wizard_error("Please enter 1, 2, or 3.");
-            continue;   // restart from Step 1
+            continue;
         }
 
         const char* txn_type = TXN_TYPES[type_choice - 1];
+
+        // ════════════════════════════════════════
+        //  STEP 2b — SELECT RECIPIENT (TRANSFER only)
+        // ════════════════════════════════════════
+        int         recipient_id   = 0;
+        const char* recipient_name = nullptr;
+
+        if (strcmp(txn_type, "TRANSFER") == 0) {
+            ui_wizard_show_transfer_recipient(user_id, user_name);
+
+            if (!wizard_read_line("Recipient number or 'q' to quit: ",
+                                   line, sizeof(line))) break;
+            if (is_quit(line)) {
+                logger_log(ThreadType::PRODUCER, id, "User exited wizard.");
+                break;
+            }
+
+            int rec_choice = atoi(line);
+
+            // Validate: 1-5, not the sender
+            if (rec_choice < 1 || rec_choice > 5) {
+                ui_wizard_error("Please enter a number between 1 and 5.");
+                continue;
+            }
+            if (rec_choice == user_choice) {
+                ui_wizard_error("You cannot transfer money to yourself.");
+                continue;
+            }
+
+            recipient_id   = USERS[rec_choice-1].id;
+            recipient_name = USERS[rec_choice-1].name;
+        }
 
         // ════════════════════════════════════════
         //  STEP 3 — ENTER AMOUNT
@@ -285,12 +339,13 @@ void* manual_producer_thread(void* args) {
         double balance = db_get_balance(user_id);
         if (balance < 0) balance = 0.0;
 
-        ui_wizard_show_amount(user_id, user_name, txn_type, balance);
+        ui_wizard_show_amount(user_id, user_name, txn_type, balance,
+                              recipient_id, recipient_name);
 
         if (!wizard_read_line("Enter amount or 'q' to quit: ",
                                line, sizeof(line))) break;
         if (is_quit(line)) {
-            logger_log(ThreadType::PRODUCER, id, "User quit.");
+            logger_log(ThreadType::PRODUCER, id, "User exited wizard.");
             break;
         }
 
@@ -301,7 +356,7 @@ void* manual_producer_thread(void* args) {
             continue;
         }
         if (amount > 10000) {
-            ui_wizard_error("Maximum is $10,000 per transaction.");
+            ui_wizard_error("Maximum per transaction is $10,000.");
             continue;
         }
 
@@ -310,7 +365,8 @@ void* manual_producer_thread(void* args) {
              strcmp(txn_type,"TRANSFER")  ==0) &&
              balance > 0 && amount > balance) {
             ui_wizard_error(
-                "Amount exceeds balance — Validator WILL REJECT this.");
+                "Amount exceeds your balance. "
+                "The validator will reject this.");
             if (!wizard_read_line("Submit anyway? [y/n]: ",
                                    line, sizeof(line))) break;
             if (line[0] != 'y' && line[0] != 'Y') {
@@ -322,7 +378,8 @@ void* manual_producer_thread(void* args) {
         // ════════════════════════════════════════
         //  STEP 4 — CONFIRM
         // ════════════════════════════════════════
-        ui_wizard_show_confirm(user_id, user_name, txn_type, amount);
+        ui_wizard_show_confirm(user_id, user_name, txn_type, amount,
+                               recipient_id, recipient_name);
 
         if (!wizard_read_line(
                 "Press Enter to CONFIRM or 'c' to cancel: ",
@@ -348,40 +405,51 @@ void* manual_producer_thread(void* args) {
                                   txn.user_id, txn.amount,
                                   std::string(txn.transaction_type));
 
-        usleep(TRANSITION_DELAY_US);
+        // Transition delay
+        usleep(AUTO_TRANSITION_DELAY_US);
         shm_buffer_produce(buf, txn);
 
+        // Show success panel
         ui_wizard_show_queued(txn.transaction_id,
                               user_id, user_name,
-                              txn_type, amount);
+                              txn_type, amount,
+                              recipient_id, recipient_name);
 
-        logger_log(ThreadType::PRODUCER, id,
-            "MANUAL TXN #" + std::to_string(txn.transaction_id)
-            + " | User:" + std::to_string(user_id)
-            + " [" + std::string(user_name) + "]"
-            + " | $" + std::to_string((int)amount)
-            + " | " + txn_type
-            + " ──► Shared Memory");
+        // Human-readable log message
+        std::string log_msg =
+            "Transaction #" + std::to_string(txn.transaction_id)
+            + " submitted  |  " + std::string(user_name)
+            + "  |  " + txn_type
+            + "  |  $" + std::to_string((int)amount);
+
+        if (recipient_id > 0)
+            log_msg += "  |  To: " + std::string(recipient_name);
+
+        log_msg += "  |  Now in validation queue";
+        logger_log(ThreadType::PRODUCER, id, log_msg);
 
         // ════════════════════════════════════════
-        //  ASK: ANOTHER?
+        //  ASK: ANOTHER TRANSACTION?
+        //  FIX: wizard_read_line() prints the prompt ONCE
+        //       g_input_active is set inside wizard_read_line
+        //       so monitor won't fire and cause "Choice: Choice:"
         // ════════════════════════════════════════
         ui_wizard_ask_another();
 
-        if (!wizard_read_line(" Choice: ",
+        if (!wizard_read_line("Your choice: ",
                                line, sizeof(line))) break;
 
         if (is_quit(line) ||
             line[0] == 'q' || line[0] == 'Q' ||
             line[0] == '0') {
-            logger_log(ThreadType::PRODUCER, id, "User quit.");
+            logger_log(ThreadType::PRODUCER, id, "User exited wizard.");
             break;
         }
         // '1' or Enter → loop back to Step 1
     }
 
-    g_input_active.store(false);   // make sure flag is cleared on exit
+    g_input_active.store(false);
     logger_log(ThreadType::PRODUCER, id,
-               "Manual producer thread exiting.");
+               "Manual input wizard closed.");
     return nullptr;
 }

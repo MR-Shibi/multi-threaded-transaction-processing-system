@@ -1,17 +1,9 @@
 // ============================================================
-//  validator.cpp
-//  VALIDATOR THREADS — Full Implementation
-//
-//  This is the most complex thread in the system.
-//  It bridges all three IPC mechanisms:
-//    Shared Memory (read) → SQLite (check) → Named Pipe (write)
-// ============================================================
-// ============================================================
-//  validator.cpp — Updated with UI formatting and transition delay
+//  validator.cpp — Updated with human-readable log messages
 // ============================================================
 
 #include "validator.h"
-#include "Transaction.h"
+#include "transaction.h"
 #include "shared_buffer.h"
 #include "fifo_queue.h"
 #include "database.h"
@@ -28,8 +20,7 @@
 
 extern std::atomic<bool> g_running;
 
-// 1-second transition delay between pipeline stages
-static const int TRANSITION_DELAY_US = 1000000;
+static const int TRANSITION_DELAY_US = AUTO_TRANSITION_DELAY_US;
 
 // ── Build SQL commit query ────────────────────────────────────
 static void build_commit_query(Transaction& txn) {
@@ -64,11 +55,11 @@ static void reject_transaction(Transaction& txn,
     db_update_raw_status(txn.transaction_id, "REJECTED");
 
     logger_log(ThreadType::VALIDATOR, thread_id,
-        "TXN #" + std::to_string(txn.transaction_id)
-        + " REJECTED | User:" + std::to_string(txn.user_id)
-        + " | $" + std::to_string((int)txn.amount)
-        + " | " + txn.transaction_type
-        + " | " + reason);
+        "Transaction #" + std::to_string(txn.transaction_id)
+        + " REJECTED  |  User:" + std::to_string(txn.user_id)
+        + "  |  $" + std::to_string((int)txn.amount)
+        + " " + txn.transaction_type
+        + "  |  Reason: " + reason);
 }
 
 // ============================================================
@@ -82,7 +73,8 @@ void* validator_thread(void* args) {
     int validated = 0;
     int rejected  = 0;
 
-    logger_log(ThreadType::VALIDATOR, id, "Started.");
+    logger_log(ThreadType::VALIDATOR, id,
+               "Validator is ready and waiting for transactions.");
 
     while (g_running.load() || shm_buffer_count(buf) > 0) {
 
@@ -93,27 +85,26 @@ void* validator_thread(void* args) {
             continue;
         }
 
-        // ── Step 1: Consume from Shared Memory ───────────────
+        // ── Consume from Shared Memory ────────────────────────
         Transaction txn = shm_buffer_consume(buf);
 
         logger_log(ThreadType::VALIDATOR, id,
-            "TXN #" + std::to_string(txn.transaction_id)
-            + " ◄── Shared Memory | User:"
-            + std::to_string(txn.user_id)
-            + " $" + std::to_string((int)txn.amount)
-            + " " + txn.transaction_type);
+            "Checking transaction #"
+            + std::to_string(txn.transaction_id)
+            + "  |  " + std::string(txn.transaction_type)
+            + " of $" + std::to_string((int)txn.amount)
+            + " for User:" + std::to_string(txn.user_id));
 
-        // ── Mark PROCESSING ───────────────────────────────────
         db_update_raw_status(txn.transaction_id, "PROCESSING");
 
-        // ── Transition delay: "checking" stage ────────────────
+        // Delay — makes validation stage visible
         usleep(TRANSITION_DELAY_US);
 
         // ── Session check ─────────────────────────────────────
         bool session_ok = db_is_session_active(txn.user_id);
         if (!session_ok) {
             reject_transaction(txn,
-                "No active session (logged out or expired)", id);
+                "Account is not logged in", id);
             rejected++;
             continue;
         }
@@ -121,7 +112,8 @@ void* validator_thread(void* args) {
         // ── Balance check ─────────────────────────────────────
         double balance = db_get_balance(txn.user_id);
         if (balance < 0) {
-            reject_transaction(txn, "User not found in DB", id);
+            reject_transaction(txn,
+                "Account not found in database", id);
             rejected++;
             continue;
         }
@@ -133,7 +125,7 @@ void* validator_thread(void* args) {
              balance < txn.amount) {
             char reason[MAX_REASON_LEN];
             snprintf(reason, MAX_REASON_LEN,
-                "Insufficient funds: balance $%.2f < requested $%.2f",
+                "Not enough funds  (balance $%.2f  requested $%.2f)",
                 balance, txn.amount);
             reject_transaction(txn, reason, id);
             rejected++;
@@ -149,27 +141,30 @@ void* validator_thread(void* args) {
         // ── Build SQL query ───────────────────────────────────
         build_commit_query(txn);
 
-        // ── Transition delay: Validator → Named Pipe ──────────
+        // Delay — makes pipe-write stage visible
         usleep(TRANSITION_DELAY_US);
 
         // ── Write to Named Pipe ───────────────────────────────
         fifo_write_query(write_fd, txn.commit_query);
-
-        // ── Mark DONE ─────────────────────────────────────────
         db_update_raw_status(txn.transaction_id, "DONE");
 
         validated++;
 
         logger_log(ThreadType::VALIDATOR, id,
-            "TXN #" + std::to_string(txn.transaction_id)
-            + " VALID ──► Named Pipe | Balance: $"
+            "Transaction #" + std::to_string(txn.transaction_id)
+            + " ACCEPTED  |  "
+            + std::string(txn.transaction_type)
+            + " of $" + std::to_string((int)txn.amount)
+            + "  |  Balance: $"
             + std::to_string((int)txn.user_balance_at_time)
-            + " → $" + std::to_string((int)txn.balance_after));
+            + " -> $" + std::to_string((int)txn.balance_after)
+            + "  |  Sent to database queue");
     }
 
     logger_log(ThreadType::VALIDATOR, id,
-        "Stopped. Validated: " + std::to_string(validated)
-        + " | Rejected: " + std::to_string(rejected));
+        "Validator finished  |  "
+        + std::to_string(validated) + " accepted  |  "
+        + std::to_string(rejected)  + " rejected");
 
     return nullptr;
 }

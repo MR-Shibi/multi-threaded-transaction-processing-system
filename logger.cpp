@@ -67,7 +67,7 @@ static void* logger_thread_func(void*) {
 
     std::string start_line = ui_format_log(
         "SYSTEM", 0,
-        "Logger thread started — rich terminal UI active.",
+        "System logger started. All output is managed centrally.",
         now_buf
     );
     printf("%s\n", start_line.c_str());
@@ -99,7 +99,7 @@ static void* logger_thread_func(void*) {
             strftime(flush_buf, sizeof(flush_buf), "%H:%M:%S", fti);
             std::string done_line = ui_format_log(
                 "SYSTEM", 0,
-                "Logger flushed. All messages delivered.",
+                "All log messages have been delivered. Logger closing.",
                 flush_buf
             );
             printf("%s\n", done_line.c_str());

@@ -2,27 +2,7 @@
 #define UI_H
 
 // ============================================================
-//  ui.h
-//  TERMINAL UI SYSTEM
-//
-//  Provides ANSI color codes, bordered panels, formatted
-//  log lines, input prompts, and pipeline visualizations.
-//
-//  Design: industrial/utilitarian dark-terminal aesthetic.
-//  Every thread type has its own color. Pipeline stages
-//  are visually distinct. Input is guided and validated.
-// ============================================================
-
-// ============================================================
-//  ANSI ESCAPE CODES
-//  These are standard terminal control sequences supported
-//  by all modern terminals (Linux, WSL, macOS Terminal).
-//  Format: \033[<code>m  where \033 is the ESC character.
-// ============================================================
-
-// ============================================================
 //  ui.h — Terminal UI System
-//  ANSI colors, bordered panels, step-by-step wizard input
 // ============================================================
 
 #include <string>
@@ -93,15 +73,19 @@
 #define THIN_MR  "┤"
 
 // ── Symbols ──────────────────────────────────────────────────
-#define ARROW_DOWN  "  ▼  "
-#define BULLET      " ●  "
-#define CHECK       " ✓  "
-#define CROSS       " ✗  "
-#define WARN        " ⚠  "
-#define INFO        " ℹ  "
+#define CHECK    " OK "
+#define CROSS    " !! "
+#define WARN     " >> "
 
 // ── Panel width ───────────────────────────────────────────────
 static const int UI_WIDTH = 64;
+
+// ── Configurable auto-mode transition delay ──────────────────
+// Change this value to slow down or speed up auto mode:
+//   500000  = 0.5 seconds (fast demo)
+//   1000000 = 1.0 second  (balanced — default)
+//   2000000 = 2.0 seconds (slow, easy to follow)
+static const int AUTO_TRANSITION_DELAY_US = 2000000;
 
 // ============================================================
 //  FUNCTION DECLARATIONS
@@ -114,32 +98,33 @@ void ui_print_final_report(int generated, int done, int rejected,
                            int pending, int processing, int committed);
 
 // ── Step-by-step transaction wizard ─────────────────────────
-// Called in sequence by manual_producer_thread():
-//   1. ui_wizard_show_users()       → user picks 1-5
-//   2. ui_wizard_show_types()       → user picks 1-3
-//   3. ui_wizard_show_amount()      → user enters amount
-//   4. ui_wizard_show_confirm()     → user confirms or cancels
-//   5. ui_wizard_show_queued()      → success panel
-//      ui_wizard_show_cancelled()   → if user cancelled
-//      ui_wizard_warn_no_session()  → warning if user 5 chosen
-
 void ui_wizard_show_users();
 void ui_wizard_show_types(int user_id, const char* user_name);
+
+// NEW: shown when user picks TRANSFER — asks for recipient
+void ui_wizard_show_transfer_recipient(int sender_id,
+                                        const char* sender_name);
+
 void ui_wizard_show_amount(int user_id, const char* user_name,
                             const char* txn_type,
-                            double current_balance);
+                            double current_balance,
+                            int recipient_id,
+                            const char* recipient_name);
+
 void ui_wizard_warn_no_session(const char* user_name);
-void ui_wizard_show_confirm(int user_id, const char* user_name,
-                             const char* txn_type, double amount);
+void ui_wizard_show_confirm(int user_id,    const char* user_name,
+                             const char* txn_type, double amount,
+                             int recipient_id, const char* recipient_name);
 void ui_wizard_show_queued(int txn_id, int user_id,
                             const char* user_name,
-                            const char* txn_type, double amount);
+                            const char* txn_type, double amount,
+                            int recipient_id, const char* recipient_name);
 void ui_wizard_show_cancelled();
 void ui_wizard_prompt(const char* step_label);
 void ui_wizard_error(const char* msg);
 void ui_wizard_ask_another();
 
-// ── Legacy input functions (used by logger / other code) ────
+// ── Legacy functions (used by other files) ───────────────────
 void ui_print_input_panel();
 void ui_print_input_prompt();
 void ui_print_input_error(const char* field, const char* reason);
@@ -147,7 +132,7 @@ void ui_print_input_success(int txn_id, int user_id,
                              double amount, const char* type);
 void ui_print_input_hint(const char* hint);
 
-// ── Pipeline transition animation ────────────────────────────
+// ── Pipeline animation ────────────────────────────────────────
 void ui_animate_transition(const char* from_stage,
                            const char* to_stage,
                            const char* detail);

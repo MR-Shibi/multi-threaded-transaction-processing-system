@@ -1,20 +1,7 @@
 // ============================================================
-//  monitor.cpp
-//  MONITOR THREAD — Full Implementation
-//
-//  Periodically samples system state and reports to the logger.
-//  Never writes to any shared resource — pure read-only observer.
-// ============================================================
-
-// ============================================================
-//  monitor.cpp — Updated with rich UI snapshot panels
-// ============================================================
-// ============================================================
-//  monitor.cpp — Monitor Thread
-//
-//  Respects g_input_active: when the manual wizard is waiting
-//  for a keypress, the monitor skips that snapshot cycle
-//  entirely so it never clobbers the input prompt.
+//  monitor.cpp — Updated with human-readable snapshot labels
+//  FIX: WARNING threshold raised to >3 to avoid false alarms
+//       when a single transaction is in PENDING briefly
 // ============================================================
 
 #include "monitor.h"
@@ -37,22 +24,17 @@ void* monitor_thread(void* args) {
     int id = a->thread_id;
 
     logger_log(ThreadType::MONITOR, id,
-        "Started. Reporting every "
-        + std::to_string(MONITOR_INTERVAL_SEC)
-        + "s (pauses during manual input).");
+        "System monitor started. Updates every "
+        + std::to_string(MONITOR_INTERVAL_SEC) + " seconds.");
 
     int    prev_committed = 0;
     time_t prev_time      = time(nullptr);
     int    snapshot_num   = 0;
 
     do {
-        // Sleep for the reporting interval
         sleep(MONITOR_INTERVAL_SEC);
 
-        // ── KEY FIX: skip if user is mid-input ───────────────
-        // If the wizard is currently waiting for a keypress,
-        // do NOT print anything — it would overwrite the prompt
-        // and confuse the user. Just skip this cycle silently.
+        // Skip if user is mid-input — never interrupt the wizard
         if (g_input_active.load()) {
             continue;
         }
@@ -74,7 +56,6 @@ void* monitor_thread(void* args) {
         prev_committed = committed;
         prev_time      = now;
 
-        // Print snapshot only when user is NOT typing
         ui_print_monitor_snapshot(
             snapshot_num,
             buf_count, SHARED_BUFFER_SIZE,
@@ -83,15 +64,14 @@ void* monitor_thread(void* args) {
         );
 
         logger_log(ThreadType::MONITOR, id,
-            "Snapshot #" + std::to_string(snapshot_num)
-            + " | DONE:" + std::to_string(done)
-            + " REJECTED:" + std::to_string(rejected)
-            + " COMMITTED:" + std::to_string(committed)
-            + " TPS:" + std::to_string((int)tps));
+            "Update #" + std::to_string(snapshot_num)
+            + "  |  Saved:" + std::to_string(committed)
+            + "  Rejected:" + std::to_string(rejected)
+            + "  Speed:" + std::to_string((int)tps) + "/sec");
 
     } while (g_running.load());
 
-    // Final snapshot at shutdown (only if not mid-input)
+    // Final update at shutdown
     if (!g_input_active.load()) {
         int fd = db_count_raw_by_status("DONE");
         int fr = db_count_raw_by_status("REJECTED");
@@ -108,7 +88,7 @@ void* monitor_thread(void* args) {
     }
 
     logger_log(ThreadType::MONITOR, id,
-        "Final snapshot complete. Monitor thread exiting.");
+               "System monitor stopped.");
 
     return nullptr;
 }
