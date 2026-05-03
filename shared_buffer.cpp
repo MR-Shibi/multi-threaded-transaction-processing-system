@@ -14,7 +14,8 @@
 #include <unistd.h>       // ftruncate, close
 #include <cstring>        // memset
 #include <stdexcept>      // std::runtime_error
-#include <cstdio>         // printf (for debug messages)
+#include <cstdio>
+#include "logger.h"
 
 // ============================================================
 //  shm_buffer_create()
@@ -83,10 +84,10 @@ SharedMemoryBuffer* shm_buffer_create() {
     // ptr points to raw bytes. We tell the compiler to treat
     // those bytes as a SharedMemoryBuffer. This is the core trick
     // of shared memory — we impose our struct layout on raw RAM.
-    // SharedMemoryBuffer* buf = static_cast<SharedMemoryBuffer*>(ptr);
+    SharedMemoryBuffer* buf = static_cast<SharedMemoryBuffer*>(ptr);
 
     // Zero out the entire struct first to clear any stale data.
-    SharedMemoryBuffer* buf = new (ptr) SharedMemoryBuffer{};
+    memset(buf, 0, sizeof(SharedMemoryBuffer));
 
     // ── Step 5: Initialize the semaphores ────────────────────
     // sem_init() initializes an unnamed semaphore in-place
@@ -131,8 +132,13 @@ SharedMemoryBuffer* shm_buffer_create() {
     buf->tail  = 0;
     buf->count = 0;
 
-    printf("[SHARED_MEM] Created segment '%s' at %p (%zu bytes)\n",
-           SHM_NAME, ptr, sizeof(SharedMemoryBuffer));
+    {
+        char _msg[128];
+        snprintf(_msg, sizeof(_msg),
+                 "Shared memory buffer ready  |  %s  |  %zu bytes",
+                 SHM_NAME, sizeof(SharedMemoryBuffer));
+        logger_log(ThreadType::SYSTEM, 0, std::string(_msg));
+    }
 
     return buf;
 }
@@ -187,7 +193,7 @@ void shm_buffer_destroy(SharedMemoryBuffer* buf) {
     // (on some systems). It's the equivalent of deleting a file.
     shm_unlink(SHM_NAME);
 
-    printf("[SHARED_MEM] Destroyed segment '%s'\n", SHM_NAME);
+    logger_log(ThreadType::SYSTEM, 0, "Shared memory segment released and cleaned up.");
 }
 
 // ============================================================

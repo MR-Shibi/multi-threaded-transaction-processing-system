@@ -29,7 +29,7 @@ static void format_time(time_t t, char* buf, int buf_size) {
 }
 
 // ── Thread type to string ────────────────────────────────────
-static const char* type_str(ThreadType t) {
+static constexpr const char* type_str(ThreadType t) {
     switch (t) {
         case ThreadType::PRODUCER:  return "PRODUCER";
         case ThreadType::VALIDATOR: return "VALIDATOR";

@@ -85,7 +85,7 @@ static const int UI_WIDTH = 64;
 //   500000  = 0.5 seconds (fast demo)
 //   1000000 = 1.0 second  (balanced — default)
 //   2000000 = 2.0 seconds (slow, easy to follow)
-static const int AUTO_TRANSITION_DELAY_US = 2000000;
+static const int AUTO_TRANSITION_DELAY_US = 1000000;
 
 // ============================================================
 //  FUNCTION DECLARATIONS

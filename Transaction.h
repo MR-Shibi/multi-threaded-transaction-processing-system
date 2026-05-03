@@ -8,6 +8,7 @@ static const int MAX_TYPE_LEN    = 16;
 static const int MAX_STATUS_LEN  = 16;
 static const int MAX_REASON_LEN  = 128;
 static const int MAX_QUERY_LEN   = 512;
+static const int MAX_NAME_LEN    = 32;
 
 static constexpr const char* TYPE_DEPOSIT    = "DEPOSIT";
 static constexpr const char* TYPE_WITHDRAWAL = "WITHDRAWAL";
@@ -28,6 +29,9 @@ struct Transaction {
     char   transaction_type[MAX_TYPE_LEN];
     time_t timestamp;
     int    retry_count;
+    // For TRANSFER: recipient (0 = not a transfer or auto-generated)
+    int    recipient_id;
+    char   recipient_name[MAX_NAME_LEN];
 
     // ── Validator fields ─────────────────────────────────────
     char   validation_status[MAX_STATUS_LEN];
@@ -36,7 +40,7 @@ struct Transaction {
     time_t session_expiry;
     long   validator_thread_id;
     time_t validation_timestamp;
-    char   commit_query[MAX_QUERY_LEN];  // Pre-built SQL INSERT — DB Updater runs this
+    char   commit_query[MAX_QUERY_LEN];
 
     // ── DB Updater fields ────────────────────────────────────
     char   final_status[MAX_STATUS_LEN];
@@ -44,7 +48,6 @@ struct Transaction {
     time_t commit_timestamp;
     long   updater_thread_id;
 
-    // Zero-initialize on construction — critical for shared memory safety
     Transaction() { memset(this, 0, sizeof(Transaction)); }
 };
 
