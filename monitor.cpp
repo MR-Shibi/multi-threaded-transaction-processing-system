@@ -28,6 +28,7 @@ void* monitor_thread(void* args) {
         + std::to_string(MONITOR_INTERVAL_SEC) + " seconds.");
 
     int    prev_committed = 0;
+    int    prev_rejected  = 0;
     time_t prev_time      = time(nullptr);
     int    snapshot_num   = 0;
 
@@ -53,21 +54,29 @@ void* monitor_thread(void* args) {
         double tps     = (elapsed > 0)
                          ? (committed - prev_committed) / elapsed
                          : 0.0;
+
+        bool changed = (committed != prev_committed) ||
+                       (rejected != prev_rejected) ||
+                       (pending > 0) || (processing > 0) || (buf_count > 0);
+
+        if (changed) {
+            ui_print_monitor_snapshot(
+                snapshot_num,
+                buf_count, SHARED_BUFFER_SIZE,
+                done, rejected, pending, processing,
+                committed, tps
+            );
+
+            logger_log(ThreadType::MONITOR, id,
+                "Update #" + std::to_string(snapshot_num)
+                + "  |  Saved:" + std::to_string(committed)
+                + "  Rejected:" + std::to_string(rejected)
+                + "  Speed:" + std::to_string((int)tps) + "/sec");
+        }
+
         prev_committed = committed;
+        prev_rejected  = rejected;
         prev_time      = now;
-
-        ui_print_monitor_snapshot(
-            snapshot_num,
-            buf_count, SHARED_BUFFER_SIZE,
-            done, rejected, pending, processing,
-            committed, tps
-        );
-
-        logger_log(ThreadType::MONITOR, id,
-            "Update #" + std::to_string(snapshot_num)
-            + "  |  Saved:" + std::to_string(committed)
-            + "  Rejected:" + std::to_string(rejected)
-            + "  Speed:" + std::to_string((int)tps) + "/sec");
 
     } while (g_running.load());
 

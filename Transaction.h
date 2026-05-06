@@ -48,7 +48,21 @@ struct Transaction {
     time_t commit_timestamp;
     long   updater_thread_id;
 
+    // ── Poison Pill ──────────────────────────────────────────
+    // When true, this is a shutdown signal — not a real transaction.
+    // Consumers (validators) must exit their loop immediately upon
+    // receiving this instead of trying to process it.
+    bool is_shutdown;
+
     Transaction() { memset(this, 0, sizeof(Transaction)); }
+
+    // Factory: creates a poison-pill transaction for graceful shutdown.
+    // main() produces one of these per validator thread.
+    static Transaction make_shutdown_pill() {
+        Transaction t;
+        t.is_shutdown = true;
+        return t;
+    }
 };
 
 #endif // TRANSACTION_H

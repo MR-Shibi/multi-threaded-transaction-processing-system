@@ -12,6 +12,7 @@
 #include <ctime>
 #include <string>
 #include <unistd.h>
+#include "database.h"
 
 static const int W = UI_WIDTH;
 
@@ -227,9 +228,17 @@ void ui_wizard_show_users() {
     };
 
     for (int i = 0; i < 5; i++) {
+        double balance = db_get_balance_global(users[i].id);
+        char bal_str[32];
+        if (balance >= 0) {
+            snprintf(bal_str, sizeof(bal_str), "$%.2f", balance);
+        } else {
+            snprintf(bal_str, sizeof(bal_str), "ERROR");
+        }
+
         char num[4];   snprintf(num, sizeof(num), "[%d]", users[i].id);
-        char nb[32];   snprintf(nb, sizeof(nb), "%-10s  %s",
-                                users[i].name, users[i].bal);
+        char nb[64];   snprintf(nb, sizeof(nb), "%-10s  %s",
+                                users[i].name, bal_str);
 
         const char* status     = users[i].active
                                ? "Logged In " : "Logged Out";
@@ -352,9 +361,17 @@ void ui_wizard_show_transfer_recipient(int sender_id,
         // Cannot transfer to yourself
         if (users[i].id == sender_id) continue;
 
+        double balance = db_get_balance_global(users[i].id);
+        char bal_str[32];
+        if (balance >= 0) {
+            snprintf(bal_str, sizeof(bal_str), "$%.2f", balance);
+        } else {
+            snprintf(bal_str, sizeof(bal_str), "ERROR");
+        }
+
         char num[4]; snprintf(num, sizeof(num), "[%d]", users[i].id);
-        char nb[32]; snprintf(nb, sizeof(nb), "%-10s  %s",
-                              users[i].name, users[i].bal);
+        char nb[64]; snprintf(nb, sizeof(nb), "%-10s  %s",
+                              users[i].name, bal_str);
 
         const char* name_col = users[i].active
                              ? ANSI_BR_WHITE : ANSI_BR_BLACK;
@@ -737,6 +754,8 @@ void ui_print_monitor_snapshot(int snapshot_num,
                                 int done,      int rejected,
                                 int pending,   int processing,
                                 int committed, double tps) {
+    (void)done;
+    (void)rejected;
     const char* bc    = ANSI_BR_MAGENTA;
     int inner = W - 2;
 
@@ -789,26 +808,61 @@ void ui_print_monitor_snapshot(int snapshot_num,
            ANSI_BOLD, bc,
            THIN_ML, ui_repeat(THIN_H, inner).c_str(), THIN_MR, ANSI_RESET);
 
-    // Stats with human-readable labels
-    auto stat = [&](const char* label, int val, const char* vc) {
-        char num[16]; snprintf(num, sizeof(num), "%d", val);
-        int vis = (int)strlen(label) + (int)strlen(num);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s%s%s\n",
+    // Live economy balances
+    {
+        double b1 = std::max(0.0, db_get_balance_global(1));
+        double b2 = std::max(0.0, db_get_balance_global(2));
+        double b3 = std::max(0.0, db_get_balance_global(3));
+        double b4 = std::max(0.0, db_get_balance_global(4));
+        char bal_str[128];
+        snprintf(bal_str, sizeof(bal_str), 
+            "A:$%-5.0f B:$%-5.0f C:$%-5.0f D:$%-5.0f", b1, b2, b3, b4);
+        std::string bal_vis = bal_str;
+        int lpad = (inner - bal_vis.length()) / 2;
+        int rpad = inner - bal_vis.length() - lpad;
+        if (lpad < 0) lpad = 0; 
+        if (rpad < 0) rpad = 0;
+        printf("%s%s%s%s%s%s%s%s%s%s\n",
                ANSI_BOLD, bc, THIN_V, ANSI_RESET,
-               ANSI_WHITE, label, ANSI_RESET,
-               std::string(pad, ' ').c_str(),
-               ANSI_BOLD, vc, num, ANSI_RESET,
+               std::string(lpad, ' ').c_str(),
+               ANSI_BR_GREEN, bal_str, ANSI_RESET,
+               std::string(rpad, ' ').c_str(),
                ANSI_BOLD, bc, THIN_V, ANSI_RESET);
-    };
+    }
 
-    stat("Validated and forwarded      ", done,       ANSI_BR_GREEN);
-    stat("Rejected (failed checks)     ", rejected,   ANSI_BR_RED);
-    stat("Waiting to be validated      ", pending,
-         pending > 0 ? ANSI_BR_YELLOW : ANSI_BR_BLACK);
-    stat("Currently being validated    ", processing,
-         processing > 0 ? ANSI_BR_YELLOW : ANSI_BR_BLACK);
-    stat("Permanently saved to database", committed,  ANSI_BR_GREEN);
+    // Divider
+    printf("%s%s%s%s%s%s\n",
+           ANSI_BOLD, bc,
+           THIN_ML, ui_repeat(THIN_H, inner).c_str(), THIN_MR, ANSI_RESET);
+
+    // Pipeline Visualizer
+    {
+        char pipe1[128];
+        snprintf(pipe1, sizeof(pipe1), 
+                 "[PRODUCER] ──(%d)──> [VALIDATOR] ──(%d)──> [UPDATER]",
+                 buf_count, processing);
+        
+        char pipe2[128];
+        snprintf(pipe2, sizeof(pipe2), 
+                 "             queue                 pipe       => %d SAVED",
+                 committed);
+
+        auto draw_pipe = [&](const char* str, const char* col) {
+            std::string s = str;
+            int lpad = (inner - s.length()) / 2;
+            int rpad = inner - s.length() - lpad;
+            if (lpad < 0) lpad = 0; 
+            if (rpad < 0) rpad = 0;
+            printf("%s%s%s%s%s%s%s%s%s%s\n",
+                   ANSI_BOLD, bc, THIN_V, ANSI_RESET,
+                   std::string(lpad, ' ').c_str(),
+                   col, str, ANSI_RESET,
+                   std::string(rpad, ' ').c_str(),
+                   ANSI_BOLD, bc, THIN_V, ANSI_RESET);
+        };
+        draw_pipe(pipe1, ANSI_BR_WHITE);
+        draw_pipe(pipe2, ANSI_BR_YELLOW);
+    }
 
     // Divider
     printf("%s%s%s%s%s%s\n",

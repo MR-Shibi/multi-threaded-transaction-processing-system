@@ -38,7 +38,7 @@ SharedMemoryBuffer* shm_buffer_create() {
     //
     // Returns a file descriptor (fd) — an integer handle to the object.
     // If it fails, returns -1.
-    int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR | O_TRUNC, 0600);  // owner-only
     if (fd == -1) {
         throw std::runtime_error("shm_open failed: could not create shared memory");
     }
@@ -87,7 +87,7 @@ SharedMemoryBuffer* shm_buffer_create() {
     SharedMemoryBuffer* buf = static_cast<SharedMemoryBuffer*>(ptr);
 
     // Zero out the entire struct first to clear any stale data.
-    memset(buf, 0, sizeof(SharedMemoryBuffer));
+    memset((void*)buf, 0, sizeof(SharedMemoryBuffer));
 
     // ── Step 5: Initialize the semaphores ────────────────────
     // sem_init() initializes an unnamed semaphore in-place
@@ -150,7 +150,7 @@ SharedMemoryBuffer* shm_buffer_create() {
 // ============================================================
 SharedMemoryBuffer* shm_buffer_attach() {
     // O_RDWR only — no O_CREAT, because it must already exist
-    int fd = shm_open(SHM_NAME, O_RDWR, 0666);
+    int fd = shm_open(SHM_NAME, O_RDWR, 0600);
     if (fd == -1) {
         throw std::runtime_error("shm_open failed: segment does not exist");
     }

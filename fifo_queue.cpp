@@ -30,7 +30,7 @@
 // ============================================================
 void fifo_create() {
     // Try to create the FIFO.
-    int result = mkfifo(FIFO_PATH, 0666);
+    int result = mkfifo(FIFO_PATH, 0600);  // owner read+write only — prevent other OS users from injecting data
 
     if (result == -1) {
         if (errno == EEXIST) {

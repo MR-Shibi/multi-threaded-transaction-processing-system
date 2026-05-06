@@ -1,99 +1,72 @@
 // ============================================================
 //  database.cpp
-//  SQLITE3 DATABASE LAYER — Full Implementation
+//  SQLITE3 DATABASE LAYER — Two-tier connection model
 //
-//  All database access in the project goes through this file.
-//  One connection, one mutex, clean API for all thread types.
+//  Tier 1 (global):  db_init/close, producer, monitor calls.
+//                    Protected by g_db_mutex.
+//
+//  Tier 2 (per-thread): validators and updaters open their own
+//                    sqlite3* connection. WAL mode allows them
+//                    to read/write without touching the mutex
+//                    or blocking each other.
 // ============================================================
 
 #include "database.h"
 #include "logger.h"
 
-#include <sqlite3.h>      // SQLite3 C API
-#include <pthread.h>      // pthread_mutex_t
-#include <cstdio>         // snprintf
-#include <cstring>        // strlen
+#include <sqlite3.h>
+#include <pthread.h>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
 #include <string>
 
 // ============================================================
-//  MODULE-LEVEL STATE (private to this file)
+//  MODULE-LEVEL STATE (Tier 1 — global connection)
 // ============================================================
-
-// The single shared database connection.
-// sqlite3* is an opaque pointer — we never look inside it.
-// All SQLite calls take this as their first argument.
-static sqlite3* g_db = nullptr;
-
-// Mutex protecting every SQLite call.
-// SQLite in "serialized" mode has some internal safety, but
-// an explicit mutex gives us clear, predictable control and
-// ensures our read-modify-write sequences (like check balance
-// then update balance) happen atomically from our perspective.
-static pthread_mutex_t g_db_mutex;
+static sqlite3*         g_db       = nullptr;
+static pthread_mutex_t  g_db_mutex;
 
 // ============================================================
-//  HELPER: db_log()
-//  Sends a message to the logger using SYSTEM thread type.
-//  Avoids repeating the logger_log() boilerplate everywhere.
+//  HELPERS
 // ============================================================
 static void db_log(const std::string& msg) {
     logger_log(ThreadType::SYSTEM, 0, "[DB] " + msg);
 }
 
-// ============================================================
-//  HELPER: exec_simple()
-//  Executes a SQL string with no return value needed.
-//  Used for CREATE TABLE, PRAGMA, INSERT seeds, etc.
-//  Must be called with the mutex already held.
-// ============================================================
-static bool exec_simple(const char* sql) {
+// exec_simple_on(): run a SQL string against ANY sqlite3* handle.
+// Caller must hold a lock if using g_db; no lock needed for per-thread conns.
+static bool exec_simple_on(sqlite3* db, const char* sql) {
     char* errmsg = nullptr;
-
-    // sqlite3_exec() compiles, runs, and finalizes the SQL in one call.
-    // The callback (3rd arg) is for SELECT results — we pass NULL here
-    // because we don't need to read results in this helper.
-    // errmsg is filled in if something goes wrong.
-    int rc = sqlite3_exec(g_db, sql, nullptr, nullptr, &errmsg);
-
+    int rc = sqlite3_exec(db, sql, nullptr, nullptr, &errmsg);
     if (rc != SQLITE_OK) {
-        std::string err = "exec_simple failed: ";
-        err += (errmsg ? errmsg : "unknown error");
+        std::string err = "SQL error: ";
+        err += (errmsg ? errmsg : "unknown");
         err += " | SQL: ";
         err += sql;
         db_log(err);
-
-        // sqlite3_free() must be called on errmsg when non-null.
-        // It was allocated by the SQLite library and only SQLite
-        // knows how to free it correctly.
         if (errmsg) sqlite3_free(errmsg);
         return false;
     }
-
     return true;
+}
+
+// Backward-compat wrapper: exec against the global connection (mutex held by caller)
+static bool exec_simple(const char* sql) {
+    return exec_simple_on(g_db, sql);
 }
 
 // ============================================================
 //  db_init()
-//  Opens the database file, enables WAL mode, creates all
-//  tables, and seeds test data.
-//
-//  WHAT IS WAL MODE?
-//  Default SQLite locking: one writer blocks ALL readers.
-//  WAL (Write-Ahead Logging): writers write to a separate
-//  .wal file. Readers see the last committed snapshot and
-//  are never blocked by a concurrent writer. This is critical
-//  for our system where validators read while updaters write.
+//  Opens the global connection, enables WAL, creates tables,
+//  seeds test data. Call ONCE from main() before any threads.
 // ============================================================
 void db_init() {
-    // ── Initialize the mutex first ───────────────────────────
     if (pthread_mutex_init(&g_db_mutex, nullptr) != 0) {
         db_log("FATAL: mutex init failed");
         return;
     }
 
-    // ── Open (or create) the database file ───────────────────
-    // sqlite3_open() creates the file if it doesn't exist.
-    // Returns SQLITE_OK (0) on success.
     int rc = sqlite3_open(DB_FILE, &g_db);
     if (rc != SQLITE_OK) {
         db_log(std::string("FATAL: cannot open database: ")
@@ -102,21 +75,16 @@ void db_init() {
     }
     db_log(std::string("Opened database: ") + DB_FILE);
 
-    // ── Enable WAL mode ──────────────────────────────────────
-    // PRAGMA is a SQLite-specific command for configuration.
-    // WAL mode persists in the database file — we only need
-    // to set it once, but setting it every startup is harmless.
+    // WAL mode: readers never block writers, writers never block readers.
+    // This is essential now that validators and updaters use separate connections.
     exec_simple("PRAGMA journal_mode=WAL;");
-
-    // ── Enable foreign keys ──────────────────────────────────
-    // SQLite doesn't enforce foreign keys by default — must opt in.
     exec_simple("PRAGMA foreign_keys=ON;");
 
-    // ── Create tables ────────────────────────────────────────
-    // IF NOT EXISTS means running this on a database that already
-    // has the tables is safe — it's a no-op, not an error.
+    // Busy timeout: if two connections collide on a write, retry for
+    // up to 5 seconds before returning SQLITE_BUSY.
+    // Without this, concurrent writes get an immediate error.
+    sqlite3_busy_timeout(g_db, 5000);
 
-    // USERS table: registered users with balances
     exec_simple(
         "CREATE TABLE IF NOT EXISTS users ("
         "  user_id      INTEGER PRIMARY KEY,"
@@ -126,21 +94,15 @@ void db_init() {
         ");"
     );
 
-    // SESSIONS table: tracks who is currently logged in.
-    // is_active: 1 = logged in, 0 = logged out.
-    // expires_at: Unix timestamp. Validator checks time(nullptr) < expires_at.
     exec_simple(
         "CREATE TABLE IF NOT EXISTS sessions ("
         "  session_id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  user_id    INTEGER NOT NULL REFERENCES users(user_id),"
         "  is_active  INTEGER NOT NULL DEFAULT 1,"
-        "  expires_at INTEGER NOT NULL"   // Unix timestamp
+        "  expires_at INTEGER NOT NULL"
         ");"
     );
 
-    // RAW_TRANSACTIONS: audit log — every transaction that ever
-    // entered Buffer 1, regardless of outcome.
-    // status progression: PENDING → PROCESSING → DONE | REJECTED
     exec_simple(
         "CREATE TABLE IF NOT EXISTS raw_transactions ("
         "  txn_id    INTEGER PRIMARY KEY,"
@@ -148,12 +110,10 @@ void db_init() {
         "  amount    REAL    NOT NULL,"
         "  type      TEXT    NOT NULL,"
         "  status    TEXT    NOT NULL DEFAULT 'PENDING',"
-        "  created_at INTEGER NOT NULL"   // Unix timestamp
+        "  created_at INTEGER NOT NULL"
         ");"
     );
 
-    // TRANSACTIONS: final record — only successfully committed ones.
-    // A row here means the money actually moved.
     exec_simple(
         "CREATE TABLE IF NOT EXISTS transactions ("
         "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -163,16 +123,11 @@ void db_init() {
         "  type          TEXT    NOT NULL,"
         "  status        TEXT    NOT NULL DEFAULT 'PAID',"
         "  balance_after REAL    NOT NULL,"
-        "  committed_at  INTEGER NOT NULL"   // Unix timestamp
+        "  committed_at  INTEGER NOT NULL"
         ");"
     );
 
     db_log("All tables created (or already exist).");
-
-    // ── Seed test data ────────────────────────────────────────
-    // INSERT OR IGNORE: if the row already exists (by PRIMARY KEY),
-    // skip it silently. This makes the seed idempotent — safe to
-    // call every time the program starts without duplicating data.
 
     exec_simple(
         "INSERT OR IGNORE INTO users(user_id, name, balance, credit_limit) VALUES"
@@ -183,17 +138,13 @@ void db_init() {
         "(5, 'Eve',      500.00, 200.00);"
     );
 
-    // Sessions: users 1-4 are logged in (active), user 5 is logged out.
-    // expires_at = now + 3600 seconds (1 hour from startup).
-    // We use strftime in SQL to get a far-future expiry for testing.
-    // The literal 9999999999 is year 2286 — effectively "never expires".
     exec_simple(
         "INSERT OR IGNORE INTO sessions(user_id, is_active, expires_at) VALUES"
-        "(1, 1, 9999999999),"   // Alice   — active
-        "(2, 1, 9999999999),"   // Bob     — active
-        "(3, 1, 9999999999),"   // Charlie — active
-        "(4, 1, 9999999999),"   // Diana   — active
-        "(5, 0, 0);"            // Eve     — logged OUT (for rejection testing)
+        "(1, 1, 9999999999),"
+        "(2, 1, 9999999999),"
+        "(3, 1, 9999999999),"
+        "(4, 1, 9999999999),"
+        "(5, 0, 0);"
     );
 
     db_log("Test data seeded (users 1-4 active, user 5 logged out).");
@@ -202,98 +153,127 @@ void db_init() {
 
 // ============================================================
 //  db_close()
-//  Closes the connection. Call after all threads are done.
 // ============================================================
 void db_close() {
     if (g_db) {
         sqlite3_close(g_db);
         g_db = nullptr;
-        db_log("Database connection closed.");
+        db_log("Global database connection closed.");
     }
     pthread_mutex_destroy(&g_db_mutex);
 }
 
 // ============================================================
-//  db_execute()
-//  Runs an arbitrary SQL string. Used by DB Updater threads
-//  to execute the pre-built commit_query from the Transaction.
+//  db_open_connection()
+//  Opens a fresh, independent SQLite connection for a thread.
 //
-//  This is the function that makes the DB Updater so simple —
-//  it just passes the string it received from the FIFO and
-//  this function handles everything else.
+//  Each Validator and Updater thread calls this at startup.
+//  The returned sqlite3* belongs entirely to that thread —
+//  no mutex is needed because no other thread touches it.
+//
+//  We enable WAL and set a busy_timeout so that the rare case
+//  of two updaters writing at the exact same millisecond will
+//  retry automatically rather than failing immediately.
 // ============================================================
-bool db_execute(const std::string& sql) {
-    pthread_mutex_lock(&g_db_mutex);
-    bool ok = exec_simple(sql.c_str());
-    pthread_mutex_unlock(&g_db_mutex);
-    return ok;
+sqlite3* db_open_connection() {
+    sqlite3* conn = nullptr;
+    int rc = sqlite3_open(DB_FILE, &conn);
+    if (rc != SQLITE_OK) {
+        db_log(std::string("db_open_connection failed: ")
+               + sqlite3_errmsg(conn));
+        sqlite3_close(conn);
+        return nullptr;
+    }
+
+    // Must re-enable WAL on every new connection.
+    exec_simple_on(conn, "PRAGMA journal_mode=WAL;");
+    exec_simple_on(conn, "PRAGMA foreign_keys=ON;");
+
+    // Retry for up to 5 seconds if another writer is active.
+    sqlite3_busy_timeout(conn, 5000);
+
+    return conn;
 }
 
 // ============================================================
-//  db_is_session_active()
-//  Called by Validator threads to check if a user is logged in.
-//
-//  Uses a PREPARED STATEMENT:
-//  Instead of building the SQL string by concatenation
-//  ("SELECT ... WHERE user_id = " + to_string(user_id))
-//  we compile the SQL once with a '?' placeholder, then bind
-//  the actual value. This is safer and faster.
-//
-//  sqlite3 prepared statement lifecycle:
-//    prepare_v2() → bind_*() → step() → finalize()
+//  db_close_connection()
 // ============================================================
-bool db_is_session_active(int user_id) {
-    pthread_mutex_lock(&g_db_mutex);
+void db_close_connection(sqlite3* conn) {
+    if (conn) sqlite3_close(conn);
+}
 
-    // The SQL we want to run. '?' is the placeholder for user_id.
-    // We check: is_active=1 AND expires_at > current Unix time.
+// ============================================================
+//  db_execute()  — Tier 2 (per-thread)
+//  Used by Updater threads to run pre-built SQL from the FIFO.
+//  No global mutex — the caller's own sqlite3* is thread-local.
+// ============================================================
+bool db_execute(sqlite3* conn, const std::string& sql) {
+    if (!conn) return false;
+    return exec_simple_on(conn, sql.c_str());
+}
+
+// ============================================================
+//  db_is_session_active()  — Tier 2 (per-thread)
+//  Called by each Validator using its own connection.
+// ============================================================
+bool db_is_session_active(sqlite3* conn, int user_id) {
+    if (!conn) return false;
+
     const char* sql =
         "SELECT COUNT(*) FROM sessions "
         "WHERE user_id = ? AND is_active = 1 AND expires_at > ?;";
 
-    // sqlite3_stmt* is the compiled (prepared) statement object.
     sqlite3_stmt* stmt = nullptr;
-
-    // sqlite3_prepare_v2() compiles the SQL into bytecode.
-    // -1 means "read until the null terminator".
-    // &stmt receives the compiled statement handle.
-    int rc = sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr);
+    int rc = sqlite3_prepare_v2(conn, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         db_log("prepare failed in db_is_session_active");
-        pthread_mutex_unlock(&g_db_mutex);
         return false;
     }
 
-    // sqlite3_bind_int() fills in the first '?' with user_id.
-    // The '1' means "bind to the 1st placeholder".
-    sqlite3_bind_int(stmt, 1, user_id);
-
-    // Bind current time to the second '?' (for expires_at check).
+    sqlite3_bind_int(stmt,   1, user_id);
     sqlite3_bind_int64(stmt, 2, (sqlite3_int64)time(nullptr));
 
-    // sqlite3_step() executes one row of the result.
-    // SQLITE_ROW means a result row is ready to read.
     bool active = false;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        // sqlite3_column_int() reads the first column (index 0) as int.
-        // COUNT(*) returns 0 or 1 here.
+    if (sqlite3_step(stmt) == SQLITE_ROW)
         active = (sqlite3_column_int(stmt, 0) > 0);
-    }
 
-    // sqlite3_finalize() frees the prepared statement.
-    // MUST be called to avoid memory leaks.
     sqlite3_finalize(stmt);
-
-    pthread_mutex_unlock(&g_db_mutex);
     return active;
 }
 
 // ============================================================
-//  db_get_balance()
-//  Returns a user's current balance.
-//  Called by Validator to check if withdrawal amount is valid.
+//  db_get_balance()  — Tier 2 (per-thread)
+//  Called by each Validator using its own connection.
 // ============================================================
-double db_get_balance(int user_id) {
+double db_get_balance(sqlite3* conn, int user_id) {
+    if (!conn) return -1.0;
+
+    const char* sql = "SELECT balance FROM users WHERE user_id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+
+    int rc = sqlite3_prepare_v2(conn, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        db_log("prepare failed in db_get_balance");
+        return -1.0;
+    }
+
+    sqlite3_bind_int(stmt, 1, user_id);
+
+    double balance = -1.0;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        balance = sqlite3_column_double(stmt, 0);
+
+    sqlite3_finalize(stmt);
+    return balance;
+}
+
+// ============================================================
+//  db_get_balance_global()  — Tier 1 (global, mutex held)
+//  Convenience wrapper used by the Manual Producer wizard to
+//  display the user's current balance during the input flow.
+//  Not performance-critical — called once per user interaction.
+// ============================================================
+double db_get_balance_global(int user_id) {
     pthread_mutex_lock(&g_db_mutex);
 
     const char* sql = "SELECT balance FROM users WHERE user_id = ?;";
@@ -301,7 +281,7 @@ double db_get_balance(int user_id) {
 
     int rc = sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        db_log("prepare failed in db_get_balance");
+        db_log("prepare failed in db_get_balance_global");
         pthread_mutex_unlock(&g_db_mutex);
         return -1.0;
     }
@@ -309,10 +289,8 @@ double db_get_balance(int user_id) {
     sqlite3_bind_int(stmt, 1, user_id);
 
     double balance = -1.0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        // sqlite3_column_double() reads the column as a double.
+    if (sqlite3_step(stmt) == SQLITE_ROW)
         balance = sqlite3_column_double(stmt, 0);
-    }
 
     sqlite3_finalize(stmt);
     pthread_mutex_unlock(&g_db_mutex);
@@ -320,9 +298,8 @@ double db_get_balance(int user_id) {
 }
 
 // ============================================================
-//  db_insert_raw_transaction()
-//  Called by Producer threads to record every new transaction
-//  in the audit log table with status PENDING.
+//  db_insert_raw_transaction()  — Tier 1 (global, mutex held)
+//  Called by Producer threads.
 // ============================================================
 bool db_insert_raw_transaction(int txn_id, int user_id,
                                double amount,
@@ -341,17 +318,12 @@ bool db_insert_raw_transaction(int txn_id, int user_id,
         return false;
     }
 
-    // Bind all four parameters in order
     sqlite3_bind_int(stmt,    1, txn_id);
     sqlite3_bind_int(stmt,    2, user_id);
     sqlite3_bind_double(stmt, 3, amount);
     sqlite3_bind_text(stmt,   4, type.c_str(), -1, SQLITE_TRANSIENT);
-    // SQLITE_TRANSIENT tells SQLite to make its own copy of the string.
-    // (As opposed to SQLITE_STATIC which assumes the string lives forever.)
     sqlite3_bind_int64(stmt,  5, (sqlite3_int64)time(nullptr));
 
-    // sqlite3_step() on an INSERT returns SQLITE_DONE (not SQLITE_ROW)
-    // when the insert completes successfully.
     bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
     if (!ok) db_log("INSERT into raw_transactions failed");
 
@@ -361,10 +333,11 @@ bool db_insert_raw_transaction(int txn_id, int user_id,
 }
 
 // ============================================================
-//  db_update_raw_status()
-//  Updates the status of a raw_transaction.
-//  Called by Validator to mark transactions as PROCESSING,
-//  then DONE or REJECTED.
+//  db_update_raw_status()  — Tier 1 (global, mutex held)
+//  Called by Validator to update audit status.
+//  NOTE: Validators call this using the global connection because
+//  status updates are short and infrequent. If this becomes a
+//  bottleneck, pass the per-thread conn here too.
 // ============================================================
 bool db_update_raw_status(int txn_id, const std::string& status) {
     pthread_mutex_lock(&g_db_mutex);
@@ -393,8 +366,33 @@ bool db_update_raw_status(int txn_id, const std::string& status) {
 }
 
 // ============================================================
-//  db_count_raw_by_status()
-//  Used by Monitor thread to count transactions in each status.
+//  db_get_raw_status()  — Tier 1 (global, mutex held)
+// ============================================================
+std::string db_get_raw_status(int txn_id) {
+    pthread_mutex_lock(&g_db_mutex);
+
+    const char* sql = "SELECT status FROM raw_transactions WHERE txn_id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    std::string status = "UNKNOWN";
+
+    int rc = sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, txn_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            status = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        }
+        sqlite3_finalize(stmt);
+    } else {
+        db_log("prepare failed in db_get_raw_status");
+    }
+
+    pthread_mutex_unlock(&g_db_mutex);
+    return status;
+}
+
+// ============================================================
+//  db_count_raw_by_status()  — Tier 1 (global, mutex held)
+//  Used by Monitor thread.
 // ============================================================
 int db_count_raw_by_status(const std::string& status) {
     pthread_mutex_lock(&g_db_mutex);
@@ -412,9 +410,8 @@ int db_count_raw_by_status(const std::string& status) {
     sqlite3_bind_text(stmt, 1, status.c_str(), -1, SQLITE_TRANSIENT);
 
     int count = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
+    if (sqlite3_step(stmt) == SQLITE_ROW)
         count = sqlite3_column_int(stmt, 0);
-    }
 
     sqlite3_finalize(stmt);
     pthread_mutex_unlock(&g_db_mutex);
@@ -422,8 +419,8 @@ int db_count_raw_by_status(const std::string& status) {
 }
 
 // ============================================================
-//  db_count_committed()
-//  Used by Monitor thread to count fully committed transactions.
+//  db_count_committed()  — Tier 1 (global, mutex held)
+//  Used by Monitor thread.
 // ============================================================
 int db_count_committed() {
     pthread_mutex_lock(&g_db_mutex);
@@ -438,9 +435,8 @@ int db_count_committed() {
     }
 
     int count = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
+    if (sqlite3_step(stmt) == SQLITE_ROW)
         count = sqlite3_column_int(stmt, 0);
-    }
 
     sqlite3_finalize(stmt);
     pthread_mutex_unlock(&g_db_mutex);

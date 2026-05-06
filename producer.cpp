@@ -76,11 +76,32 @@ static void strip_input(char* buf) {
 // Sets g_input_active=true BEFORE printing the prompt.
 // This must be called as the very first output after any panel.
 // The monitor will not print while this flag is true.
-static bool wizard_read_line(const char* prompt,
-                              char* buf, int buf_size) {
+static bool wizard_read_line(const char* prompt, char* buf, int buf_size) {
     g_input_active.store(true);
     ui_wizard_prompt(prompt);
-    bool ok = (fgets(buf, buf_size, stdin) != nullptr);
+
+    bool ok = false;
+    while (g_running.load()) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000; // 100ms timeout
+
+        int ret = select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv);
+        if (ret > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
+            if (fgets(buf, buf_size, stdin) != nullptr) {
+                ok = true;
+            }
+            break;
+        } else if (ret < 0) {
+            // Error or signal interrupt
+            break;
+        }
+    }
+
     g_input_active.store(false);
     if (!ok) return false;
     strip_input(buf);
@@ -291,7 +312,7 @@ void* manual_producer_thread(void* args) {
         }
 
         // ── STEP 3: Enter amount ──────────────────────────────
-        double balance = db_get_balance(user_id);
+        double balance = db_get_balance_global(user_id);  // Tier-1: global conn
         if (balance < 0) balance = 0.0;
 
         g_input_active.store(true);
@@ -374,6 +395,19 @@ void* manual_producer_thread(void* args) {
         log_msg += "  |  Now in validation queue";
         logger_log(ThreadType::PRODUCER, id, log_msg);
 
+        // ── Wait for Validation ───────────────────────────────
+        // The user specifically requested that the wizard wait 
+        // until the pipeline finishes processing before prompting.
+        while (g_running.load()) {
+            std::string status = db_get_raw_status(txn.transaction_id);
+            if (status == "DONE" || status == "REJECTED" || status == "FAILED") {
+                // Let the logger print the final acceptance/rejection log
+                usleep(300000); 
+                break;
+            }
+            usleep(100000); // Poll every 100ms
+        }
+
         // ── Another transaction? ──────────────────────────────
         // Set flag BEFORE drawing panel so zero log lines can
         // appear between the panel bottom border and the prompt.
@@ -392,5 +426,9 @@ void* manual_producer_thread(void* args) {
 
     g_input_active.store(false);
     logger_log(ThreadType::PRODUCER, id, "Manual input wizard closed.");
+    
+    // If the manual wizard exits (by user pressing 'q'), shut down the whole system
+    g_running.store(false); 
+    
     return nullptr;
 }

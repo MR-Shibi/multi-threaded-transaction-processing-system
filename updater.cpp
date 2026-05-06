@@ -9,6 +9,9 @@
 #include "ui.h"
 
 #include <cstring>
+#include <atomic>
+
+extern std::atomic<bool> g_running;
 #include <cstdio>
 #include <unistd.h>
 #include <string>
@@ -24,6 +27,17 @@ void* updater_thread(void* args) {
     int  committed = 0;
     int  failed    = 0;
 
+    // ── Open per-thread DB connection (Tier 2) ───────────────
+    // The updater runs SQL it received from the FIFO.
+    // With a private connection + WAL mode, writes from multiple
+    // updater threads can proceed concurrently without any mutex.
+    sqlite3* conn = db_open_connection();
+    if (!conn) {
+        logger_log(ThreadType::UPDATER, id,
+            "FATAL: could not open DB connection. Thread exiting.");
+        return nullptr;
+    }
+
     logger_log(ThreadType::UPDATER, id,
                "Database writer ready. Waiting for validated transactions.");
 
@@ -32,40 +46,50 @@ void* updater_thread(void* args) {
 
     while (fifo_read_query(read_fd, raw_query)) {
 
-        usleep(AUTO_TRANSITION_DELAY_US);
+        if (g_running.load()) usleep(AUTO_TRANSITION_DELAY_US);
 
         wrap_in_transaction(raw_query, wrapped, sizeof(wrapped));
-        bool ok = db_execute(std::string(wrapped));
+        bool ok = db_execute(conn, std::string(wrapped));  // Tier 2: no mutex
 
         if (ok) {
             committed++;
 
+            // Parse transaction details from the query for logging.
+            // The new SQL format (TOCTOU fix) uses SELECT not VALUES:
+            //   "... INSERT INTO transactions(...) SELECT txn_id,user_id,amount,'type'..."
+            // We scan from the "SELECT " token inside the INSERT clause.
             int    txn_id       = -1;
             int    user_id      = -1;
             double amount       = 0.0;
             char   type[16]     = "";
-            double balance_after = 0.0;
 
-            const char* vp = strstr(raw_query, "VALUES(");
-            if (vp) {
-                sscanf(vp,
-                    "VALUES(%d, %d, %lf, '%15[^']', 'PAID', %lf",
-                    &txn_id, &user_id, &amount, type, &balance_after);
+            // Find the INSERT's SELECT clause (skip the UPDATE's SELECT if any)
+            const char* insert_pos = strstr(raw_query, "INSERT INTO");
+            const char* select_pos = insert_pos
+                                   ? strstr(insert_pos, "SELECT ")
+                                   : nullptr;
+            if (select_pos) {
+                sscanf(select_pos,
+                    "SELECT %d,%d,%lf,'%15[^']'",
+                    &txn_id, &user_id, &amount, type);
             }
 
             std::string msg;
             if (txn_id > 0) {
+                db_update_raw_status(txn_id, "DONE");
                 msg = "Transaction #" + std::to_string(txn_id)
                     + " SAVED to database  |  "
                     + std::string(type)
                     + " of $" + std::to_string((int)amount)
-                    + "  |  New balance: $"
-                    + std::to_string((int)balance_after)
                     + "  |  Total saved today: "
                     + std::to_string(committed);
             } else {
-                msg = "Transaction saved.  Total: "
-                      + std::to_string(committed);
+                // INSERT was skipped by "changes() > 0" guard — a concurrent
+                // transaction already consumed the funds. This is correct
+                // behavior, not an error. The raw_transaction stays as DONE
+                // (the validator approved it) but no money moved.
+                msg = "Transaction executed (funds may have been taken by "
+                      "concurrent txn).  Total: " + std::to_string(committed);
             }
             logger_log(ThreadType::UPDATER, id, msg);
 
@@ -78,6 +102,9 @@ void* updater_thread(void* args) {
     }
 
     fifo_close(read_fd);
+
+    // ── Close per-thread connection ───────────────────────────
+    db_close_connection(conn);
 
     logger_log(ThreadType::UPDATER, id,
         "Database writer finished  |  "

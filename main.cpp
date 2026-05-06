@@ -369,14 +369,14 @@ int main(int argc, char* argv[]) {
         "All threads active. Press Ctrl+C to stop.");
 
     // ── Wait for shutdown signal ──────────────────────────────
-    while (g_running.load()) pause();
+    while (g_running.load()) usleep(100000);
 
     // ── Ordered graceful shutdown ─────────────────────────────
     logger_log(ThreadType::SYSTEM, 0, "Shutdown in progress...");
 
     if (manual_mode) fclose(stdin);
 
-    // 1. Join producers
+    // 1. Stop producers (they check g_running)
     if (auto_mode)
         for (int i = 0; i < NUM_PRODUCERS; i++)
             pthread_join(prod_tids[i], nullptr);
@@ -384,22 +384,31 @@ int main(int argc, char* argv[]) {
         pthread_join(manual_tid, nullptr);
     logger_log(ThreadType::SYSTEM, 0, "Producers stopped.");
 
-    // 2. Join validators
+    // 2. Push one poison pill per validator into the shared buffer.
+    //    Each validator is blocked on shm_buffer_consume(). The pill
+    //    wakes it up and it exits immediately when it sees is_shutdown.
+    //    Without this, validators deadlock in pthread_join forever.
+    logger_log(ThreadType::SYSTEM, 0,
+        "Sending shutdown signals to validators...");
+    for (int i = 0; i < NUM_VALIDATORS; i++)
+        shm_buffer_produce(buf, Transaction::make_shutdown_pill());
+
+    // 3. Join validators
     for (int i = 0; i < NUM_VALIDATORS; i++)
         pthread_join(val_tids[i], nullptr);
     logger_log(ThreadType::SYSTEM, 0,
                "Validators stopped. All queries in pipe.");
 
-    // 3. Close write end → EOF signal to updaters
+    // 4. Close write end → EOF signal to updaters
     fifo_close(write_fd);
 
-    // 4. Join updaters
+    // 5. Join updaters
     for (int i = 0; i < NUM_UPDATERS; i++)
         pthread_join(upd_tids[i], nullptr);
     logger_log(ThreadType::SYSTEM, 0,
                "Updaters stopped. All queries committed.");
 
-    // 5. Join monitor
+    // 6. Join monitor
     pthread_join(monitor_tid, nullptr);
     logger_log(ThreadType::SYSTEM, 0, "Monitor stopped.");
 
