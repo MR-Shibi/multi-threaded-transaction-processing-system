@@ -16,11 +16,14 @@ Course: Operating Systems · Instructor: Sir Minhal Raza
 
 ---
 
-## Overview
+## 🚀 Overview
 
-A complete, production-quality simulation of a multi-stage banking transaction pipeline built entirely with low-level OS primitives. Every transaction travels through **three thread stages** connected by **two different IPC mechanisms**, demonstrating the Producer-Consumer problem, semaphore synchronization, mutex locks, signal handling, and persistent database storage — all working together in one running system.
+A production-quality simulation of a multi-stage banking transaction pipeline built with low-level OS primitives. Every transaction travels through **three thread stages** connected by **two distinct IPC mechanisms**, demonstrating the Producer-Consumer problem, semaphore synchronization, mutex locks, signal handling, and persistent database storage.
 
-The system features a **rich terminal UI** with ANSI colors, bordered panels, per-thread color identity, and a **step-by-step guided wizard** for manual transaction input that never gets interrupted by background monitoring.
+**Key Hardening Features:**
+- **Logger Muting System**: A synchronization flag (`g_input_active`) that automatically pauses background logs when the user is typing in the manual wizard, ensuring a flicker-free UI.
+- **Traffic Intelligence**: The live monitor now tracks and displays a real-time breakdown of transaction types (Deposits, Withdrawals, Transfers).
+- **Atomic SQL Arithmetic**: Prevents "Lost Update" race conditions by calculating balances directly in the SQL statement.
 
 ---
 
@@ -116,18 +119,12 @@ The system features a **rich terminal UI** with ANSI colors, bordered panels, pe
 - **Full audit trail** — every transaction recorded from creation to commit or rejection
 
 ### Terminal UI
+- **Logger Muting** — background logs pause automatically while the user is typing to prevent screen flicker
 - **ANSI color system** — each thread type has a unique color identity
 - **Bordered panels** — box-drawing characters for all major output
-- **Step-by-step wizard** — numbered menus replace free-text input (no more typos)
-- **Monitor panels** — live snapshots with ASCII buffer bar and throughput
-- **1-second delays** — each pipeline stage transition is clearly visible
-- **Non-interrupting monitor** — pauses automatically while user is typing
-
-### System Quality
-- **Signal handling** — `Ctrl+C` triggers fully ordered graceful shutdown
-- **Ordered shutdown** — producers → validators → pipe close → updaters → monitor
-- **Zero data loss** — every transaction in the pipeline is committed before exit
-- **Command-line modes** — `--auto`, `--manual`, `--both`
+- **Monitor Dashboard** — live snapshots with ASCII buffer bar and **Traffic Summary** (type counts)
+- **1-second delays** — each pipeline stage transition is clearly visible for demonstration
+- **Signal handling** — `Ctrl+C` triggers fully ordered graceful shutdown sequence
 
 ---
 
@@ -140,11 +137,10 @@ The system features a **rich terminal UI** with ANSI colors, bordered panels, pe
 | Mutex Locks | Buffer, database connection, log queue | `pthread_mutex_lock/unlock` |
 | POSIX Shared Memory | Buffer 1 — Transaction struct storage | `shm_open`, `ftruncate`, `mmap`, `shm_unlink` |
 | Named Pipes / FIFO | Buffer 2 — SQL query string channel | `mkfifo`, `open`, `write`, `read` |
-| Atomic Operations | Shutdown flag, transaction ID counter, input flag | `std::atomic<bool/int>` |
-| Signal Handling | Graceful Ctrl+C / kill shutdown | `sigaction`, `SA_RESTART` |
-| Blocking I/O | `sem_wait` and pipe `read` sleep the thread | Zero busy-waiting |
+| Atomic Operations | Shutdown flag, input mute flag, txn counters | `std::atomic<bool/int>` |
+| Signal Handling | Graceful Ctrl+C shutdown | `sigaction`, `SA_RESTART` |
 | WAL Mode | Concurrent read-while-write in SQLite | `PRAGMA journal_mode=WAL` |
-| Process-Shared Mutex | Mutex embedded in shared memory segment | `PTHREAD_PROCESS_SHARED` |
+| Atomic SQL | Prevents Lost Updates via relative arithmetic | `UPDATE users SET balance = balance + ?` |
 | Producer-Consumer | Two-stage pipeline, validator is both | Consumer of SHM + Producer of FIFO |
 
 ---
