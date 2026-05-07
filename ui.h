@@ -151,7 +151,8 @@ void ui_print_monitor_snapshot(int snapshot_num,
                                 int buf_count, int buf_total,
                                 int done, int rejected,
                                 int pending, int processing,
-                                int committed, double tps);
+                                int committed, double tps,
+                                int deposits, int withdrawals, int transfers);
 
 // ── Utilities ─────────────────────────────────────────────────
 std::string ui_repeat(const char* s, int n);

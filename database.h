@@ -92,6 +92,7 @@ std::string db_get_raw_status(int txn_id);
 int db_count_raw_by_status(const std::string& status);
 
 // Returns total count of committed transactions.
+int db_count_raw_by_type(const std::string& type);
 int db_count_committed();
 
 // Returns a user's current balance via the global connection.

@@ -419,6 +419,33 @@ int db_count_raw_by_status(const std::string& status) {
 }
 
 // ============================================================
+//  db_count_raw_by_type()  — Tier 1 (global, mutex held)
+// ============================================================
+int db_count_raw_by_type(const std::string& type) {
+    pthread_mutex_lock(&g_db_mutex);
+
+    const char* sql =
+        "SELECT COUNT(*) FROM raw_transactions WHERE type = ?;";
+
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return -1;
+    }
+
+    sqlite3_bind_text(stmt, 1, type.c_str(), -1, SQLITE_TRANSIENT);
+
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        count = sqlite3_column_int(stmt, 0);
+
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+    return count;
+}
+
+// ============================================================
 //  db_count_committed()  — Tier 1 (global, mutex held)
 //  Used by Monitor thread.
 // ============================================================

@@ -753,7 +753,8 @@ void ui_print_monitor_snapshot(int snapshot_num,
                                 int buf_count, int buf_total,
                                 int done,      int rejected,
                                 int pending,   int processing,
-                                int committed, double tps) {
+                                int committed, double tps,
+                                int deposits,  int withdrawals, int transfers) {
     (void)done;
     (void)rejected;
     const char* bc    = ANSI_BR_MAGENTA;
@@ -834,6 +835,25 @@ void ui_print_monitor_snapshot(int snapshot_num,
     printf("%s%s%s%s%s%s\n",
            ANSI_BOLD, bc,
            THIN_ML, ui_repeat(THIN_H, inner).c_str(), THIN_MR, ANSI_RESET);
+
+    // Traffic Summary
+    {
+        char traffic[128];
+        snprintf(traffic, sizeof(traffic),
+                 "Deposits:%-3d Withdrawals:%-3d Transfers:%-3d",
+                 deposits, withdrawals, transfers);
+        std::string t_vis = traffic;
+        int lpad = (inner - t_vis.length()) / 2;
+        int rpad = inner - t_vis.length() - lpad;
+        if (lpad < 0) lpad = 0;
+        if (rpad < 0) rpad = 0;
+        printf("%s%s%s%s%s%s%s%s%s%s\n",
+               ANSI_BOLD, bc, THIN_V, ANSI_RESET,
+               std::string(lpad, ' ').c_str(),
+               ANSI_BOLD ANSI_WHITE, traffic, ANSI_RESET,
+               std::string(rpad, ' ').c_str(),
+               ANSI_BOLD, bc, THIN_V, ANSI_RESET);
+    }
 
     // Pipeline Visualizer
     {

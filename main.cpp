@@ -359,8 +359,11 @@ int main(int argc, char* argv[]) {
 
     // ── Start Manual Producer ─────────────────────────────────
     if (manual_mode) {
+        // manual=true means "I am the only mode — quitting wizard shuts system down"
+        // manual=false means "combined mode — quitting wizard just closes wizard"
+        bool manual_only = !auto_mode;
         manual_args = { buf, auto_mode ? 4 : 1,
-                        ProducerStyle::SLOW, true };
+                        ProducerStyle::SLOW, manual_only };
         pthread_create(&manual_tid, nullptr,
                        manual_producer_thread, &manual_args);
     }

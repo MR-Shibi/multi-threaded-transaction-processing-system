@@ -233,6 +233,7 @@ void* manual_producer_thread(void* args) {
     ProducerArgs* a         = static_cast<ProducerArgs*>(args);
     SharedMemoryBuffer* buf = a->buffer;
     int id                  = a->thread_id;
+    bool manual_only        = a->manual;  // true = --manual mode; false = combined
 
     logger_log(ThreadType::PRODUCER, id, "Manual input wizard is ready.");
 
@@ -426,9 +427,13 @@ void* manual_producer_thread(void* args) {
 
     g_input_active.store(false);
     logger_log(ThreadType::PRODUCER, id, "Manual input wizard closed.");
-    
-    // If the manual wizard exits (by user pressing 'q'), shut down the whole system
-    g_running.store(false); 
-    
+
+    // Only trigger a full system shutdown if we are the ONLY mode running.
+    // In combined mode (auto + manual), quitting the wizard just closes it;
+    // the auto producers keep running until Ctrl+C.
+    if (manual_only) {
+        g_running.store(false);
+    }
+
     return nullptr;
 }

@@ -49,6 +49,10 @@ void* monitor_thread(void* args) {
         int committed  = db_count_committed();
         int buf_count  = shm_buffer_count(buf);
 
+        int dep = db_count_raw_by_type("DEPOSIT");
+        int wth = db_count_raw_by_type("WITHDRAWAL");
+        int trn = db_count_raw_by_type("TRANSFER");
+
         time_t now     = time(nullptr);
         double elapsed = difftime(now, prev_time);
         double tps     = (elapsed > 0)
@@ -64,7 +68,8 @@ void* monitor_thread(void* args) {
                 snapshot_num,
                 buf_count, SHARED_BUFFER_SIZE,
                 done, rejected, pending, processing,
-                committed, tps
+                committed, tps,
+                dep, wth, trn
             );
 
             logger_log(ThreadType::MONITOR, id,
@@ -88,11 +93,15 @@ void* monitor_thread(void* args) {
         int fc = db_count_raw_by_status("PROCESSING");
         int fm = db_count_committed();
         int fb = shm_buffer_count(buf);
+        int fd1 = db_count_raw_by_type("DEPOSIT");
+        int fw1 = db_count_raw_by_type("WITHDRAWAL");
+        int ft1 = db_count_raw_by_type("TRANSFER");
 
         ui_print_monitor_snapshot(
             snapshot_num + 1,
             fb, SHARED_BUFFER_SIZE,
-            fd, fr, fp, fc, fm, 0.0
+            fd, fr, fp, fc, fm, 0.0,
+            fd1, fw1, ft1
         );
     }
 

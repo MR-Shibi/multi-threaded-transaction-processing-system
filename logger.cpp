@@ -15,12 +15,16 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <unistd.h>
 
 // ── Module-level state ───────────────────────────────────────
 static std::queue<LogMessage> g_log_queue;
 static pthread_mutex_t        g_queue_mutex;
 static sem_t                  g_queue_sem;
 static pthread_t              g_logger_thread;
+
+#include <atomic>
+extern std::atomic<bool> g_input_active;
 
 // ── Format time ──────────────────────────────────────────────
 static void format_time(time_t t, char* buf, int buf_size) {
@@ -75,6 +79,12 @@ static void* logger_thread_func(void*) {
 
     while (true) {
         sem_wait(&g_queue_sem);
+
+        // Pause logging if the user is currently typing in the manual wizard.
+        // This keeps the wizard's panel clean and prevents interleaving.
+        while (g_input_active.load()) {
+            usleep(50000); // 50ms check
+        }
 
         pthread_mutex_lock(&g_queue_mutex);
         LogMessage msg = g_log_queue.front();
