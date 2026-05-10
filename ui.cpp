@@ -32,7 +32,6 @@ static WINDOW *w_validators = nullptr;
 static WINDOW *w_validators_in = nullptr;
 static WINDOW *w_updaters = nullptr;
 static WINDOW *w_updaters_in = nullptr;
-static WINDOW *w_metrics = nullptr;
 static WINDOW *w_queue = nullptr;
 static WINDOW *w_events = nullptr;
 static WINDOW *w_events_in = nullptr;
@@ -208,7 +207,6 @@ void ui_init() {
   w_history    = newwin(b_h, half, HIST_START, 0);
   w_history_in = derwin(w_history, b_h - 3, half - 4, 2, 2);
     
-  w_metrics    = nullptr; // No longer showing metrics
     
   w_footer     = newwin(FOOTER_H, S_COLS, S_ROWS - FOOTER_H, 0);
 
@@ -281,8 +279,6 @@ void ui_shutdown() {
     delwin(w_updaters_in);
   if (w_updaters)
     delwin(w_updaters);
-  if (w_metrics)
-    delwin(w_metrics);
   if (w_events_in)
     delwin(w_events_in);
   if (w_events)

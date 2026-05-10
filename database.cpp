@@ -51,11 +51,6 @@ static bool exec_simple_on(sqlite3* db, const char* sql) {
     return true;
 }
 
-// Backward-compat wrapper: exec against the global connection (mutex held by caller)
-static bool exec_simple(const char* sql) {
-    return exec_simple_on(g_db, sql);
-}
-
 // ============================================================
 //  db_init()
 //  Opens the global connection, enables WAL, creates tables,
@@ -76,16 +71,12 @@ void db_init() {
     db_log(std::string("Opened database: ") + DB_FILE);
 
     // WAL mode: readers never block writers, writers never block readers.
-    // This is essential now that validators and updaters use separate connections.
-    exec_simple("PRAGMA journal_mode=WAL;");
-    exec_simple("PRAGMA foreign_keys=ON;");
+    exec_simple_on(g_db, "PRAGMA journal_mode=WAL;");
+    exec_simple_on(g_db, "PRAGMA foreign_keys=ON;");
 
-    // Busy timeout: if two connections collide on a write, retry for
-    // up to 5 seconds before returning SQLITE_BUSY.
-    // Without this, concurrent writes get an immediate error.
     sqlite3_busy_timeout(g_db, 5000);
 
-    exec_simple(
+    exec_simple_on(g_db,
         "CREATE TABLE IF NOT EXISTS users ("
         "  user_id      INTEGER PRIMARY KEY,"
         "  name         TEXT    NOT NULL,"
@@ -94,7 +85,7 @@ void db_init() {
         ");"
     );
 
-    exec_simple(
+    exec_simple_on(g_db,
         "CREATE TABLE IF NOT EXISTS sessions ("
         "  session_id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  user_id    INTEGER NOT NULL REFERENCES users(user_id),"
@@ -103,7 +94,7 @@ void db_init() {
         ");"
     );
 
-    exec_simple(
+    exec_simple_on(g_db,
         "CREATE TABLE IF NOT EXISTS raw_transactions ("
         "  txn_id    INTEGER PRIMARY KEY,"
         "  user_id   INTEGER NOT NULL,"
@@ -114,7 +105,7 @@ void db_init() {
         ");"
     );
 
-    exec_simple(
+    exec_simple_on(g_db,
         "CREATE TABLE IF NOT EXISTS transactions ("
         "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  txn_id        INTEGER NOT NULL,"
@@ -127,9 +118,7 @@ void db_init() {
         ");"
     );
 
-    db_log("All tables created (or already exist).");
-
-    exec_simple(
+    exec_simple_on(g_db,
         "INSERT OR IGNORE INTO users(user_id, name, balance, credit_limit) VALUES"
         "(1, 'Alice',   1500.00, 500.00),"
         "(2, 'Bob',     2200.00, 1000.00),"
@@ -138,7 +127,7 @@ void db_init() {
         "(5, 'Eve',      500.00, 200.00);"
     );
 
-    exec_simple(
+    exec_simple_on(g_db,
         "INSERT OR IGNORE INTO sessions(user_id, is_active, expires_at) VALUES"
         "(1, 1, 9999999999),"
         "(2, 1, 9999999999),"
@@ -147,7 +136,6 @@ void db_init() {
         "(5, 0, 0);"
     );
 
-    db_log("Test data seeded (users 1-4 active, user 5 logged out).");
     db_log("Database initialization complete.");
 }
 

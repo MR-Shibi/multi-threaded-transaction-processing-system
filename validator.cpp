@@ -15,7 +15,6 @@
 #include <cstring>
 #include <ctime>
 #include <pthread.h>
-#include <iostream>
 #include <string>
 #include <thread>
 #include <unistd.h>

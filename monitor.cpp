@@ -19,6 +19,24 @@
 extern std::atomic<bool> g_running;
 extern std::atomic<bool> g_input_active;
 
+struct SystemStats {
+    int done, rejected, pending, processing, committed;
+    int dep, wth, trn;
+};
+
+static SystemStats get_system_stats() {
+    SystemStats s;
+    s.done       = db_count_raw_by_status("DONE");
+    s.rejected   = db_count_raw_by_status("REJECTED");
+    s.pending    = db_count_raw_by_status("PENDING");
+    s.processing = db_count_raw_by_status("PROCESSING");
+    s.committed  = db_count_committed();
+    s.dep        = db_count_raw_by_type("DEPOSIT");
+    s.wth        = db_count_raw_by_type("WITHDRAWAL");
+    s.trn        = db_count_raw_by_type("TRANSFER");
+    return s;
+}
+
 void* monitor_thread(void* args) {
     MonitorArgs*        a   = static_cast<MonitorArgs*>(args);
     SharedMemoryBuffer* buf = a->buffer;
@@ -42,67 +60,49 @@ void* monitor_thread(void* args) {
         }
 
         snapshot_num++;
-
-        int done       = db_count_raw_by_status("DONE");
-        int rejected   = db_count_raw_by_status("REJECTED");
-        int pending    = db_count_raw_by_status("PENDING");
-        int processing = db_count_raw_by_status("PROCESSING");
-        int committed  = db_count_committed();
-        int buf_count  = shm_buffer_count(buf);
-
-        int dep = db_count_raw_by_type("DEPOSIT");
-        int wth = db_count_raw_by_type("WITHDRAWAL");
-        int trn = db_count_raw_by_type("TRANSFER");
+        SystemStats s = get_system_stats();
+        int buf_count = shm_buffer_count(buf);
 
         time_t now     = time(nullptr);
         double elapsed = difftime(now, prev_time);
         double tps     = (elapsed > 0)
-                         ? (committed - prev_committed) / elapsed
+                         ? (s.committed - prev_committed) / elapsed
                          : 0.0;
 
-        bool changed = (committed != prev_committed) ||
-                       (rejected != prev_rejected) ||
-                       (pending > 0) || (processing > 0) || (buf_count > 0);
+        bool changed = (s.committed != prev_committed) ||
+                       (s.rejected != prev_rejected) ||
+                       (s.pending > 0) || (s.processing > 0) || (buf_count > 0);
 
         if (changed) {
             ui_update_monitor(
                 snapshot_num,
                 buf_count, SHARED_BUFFER_SIZE,
-                done, rejected, pending, processing,
-                committed, tps,
-                dep, wth, trn
+                s.done, s.rejected, s.pending, s.processing,
+                s.committed, tps,
+                s.dep, s.wth, s.trn
             );
 
             logger_log(ThreadType::MONITOR, id,
                 "Update #" + std::to_string(snapshot_num)
-                + "  |  Saved:" + std::to_string(committed)
-                + "  Rejected:" + std::to_string(rejected)
+                + "  |  Saved:" + std::to_string(s.committed)
+                + "  Rejected:" + std::to_string(s.rejected)
                 + "  Speed:" + std::to_string((int)tps) + "/sec");
         }
 
-        prev_committed = committed;
-        prev_rejected  = rejected;
+        prev_committed = s.committed;
+        prev_rejected  = s.rejected;
         prev_time      = now;
 
     } while (g_running.load());
 
     // Final update at shutdown
     if (!g_input_active.load()) {
-        int fd = db_count_raw_by_status("DONE");
-        int fr = db_count_raw_by_status("REJECTED");
-        int fp = db_count_raw_by_status("PENDING");
-        int fc = db_count_raw_by_status("PROCESSING");
-        int fm = db_count_committed();
-        int fb = shm_buffer_count(buf);
-        int fd1 = db_count_raw_by_type("DEPOSIT");
-        int fw1 = db_count_raw_by_type("WITHDRAWAL");
-        int ft1 = db_count_raw_by_type("TRANSFER");
-
+        SystemStats s = get_system_stats();
         ui_update_monitor(
             snapshot_num + 1,
-            fb, SHARED_BUFFER_SIZE,
-            fd, fr, fp, fc, fm, 0.0,
-            fd1, fw1, ft1
+            shm_buffer_count(buf), SHARED_BUFFER_SIZE,
+            s.done, s.rejected, s.pending, s.processing, s.committed, 0.0,
+            s.dep, s.wth, s.trn
         );
     }
 
