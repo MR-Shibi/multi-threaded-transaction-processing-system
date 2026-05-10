@@ -1,10 +1,13 @@
 #include "ui.h"
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <mutex>
 #include <ncurses.h>
 #include <string>
+#include <thread>
 #include <vector>
 
 std::mutex g_ui_mutex;
@@ -40,8 +43,6 @@ static WINDOW *w_wizard = nullptr;
 
 // ── Per-thread status storage ────────────────────────────────
 static char g_prod_st[4][72] = {};
-static char g_val_st[2][72] = {};
-static char g_upd_st[2][72] = {};
 
 // ── Queue entries ─────────────────────────────────────────────
 struct QEntry {
@@ -77,6 +78,19 @@ static void titled_box(WINDOW *w, const char *title, int cp) {
   }
 }
 
+// Helper to keep wizard on top during any background update
+static void refresh_with_wizard(WINDOW* parent, WINDOW* child) {
+    touchwin(parent);
+    wnoutrefresh(parent);
+    if (child) wnoutrefresh(child);
+    
+    if (w_wizard) {
+        touchwin(w_wizard);
+        wnoutrefresh(w_wizard);
+    }
+    doupdate();
+}
+
 // ── Redraw Thread Sections ────────────────────────────────────
 static void redraw_producers() {
   if (!w_producers)
@@ -93,35 +107,7 @@ static void redraw_producers() {
   wrefresh(w_producers);
 }
 
-static void redraw_validators() {
-  if (!w_validators)
-    return;
-  werase(w_validators);
-  titled_box(w_validators, "VALIDATORS", CP_VALIDATOR);
-  for (int i = 0; i < 2; i++) {
-    if (!g_val_st[i][0])
-      continue;
-    wattron(w_validators, COLOR_PAIR(CP_VALIDATOR));
-    mvwprintw(w_validators, i + 1, 2, "V-%d: %s", i + 1, g_val_st[i]);
-    wattroff(w_validators, COLOR_PAIR(CP_VALIDATOR));
-  }
-  wrefresh(w_validators);
-}
-
-static void redraw_updaters() {
-  if (!w_updaters)
-    return;
-  werase(w_updaters);
-  titled_box(w_updaters, "UPDATERS", CP_UPDATER);
-  for (int i = 0; i < 2; i++) {
-    if (!g_upd_st[i][0])
-      continue;
-    wattron(w_updaters, COLOR_PAIR(CP_UPDATER));
-    mvwprintw(w_updaters, i + 1, 2, "U-%d: %s", i + 1, g_upd_st[i]);
-    wattroff(w_updaters, COLOR_PAIR(CP_UPDATER));
-  }
-  wrefresh(w_updaters);
-}
+// (Redraw functions removed as we now use live scrolling sub-windows)
 
 // ── Redraw queue panel ────────────────────────────────────────
 static void redraw_queue() {
@@ -169,7 +155,7 @@ void ui_init() {
   initscr();
   cbreak();
   noecho();
-  keypad(stdscr, TRUE);
+  keypad(stdscr, TRUE); // Enable keyboard input
   curs_set(0);
   start_color();
   use_default_colors();
@@ -184,6 +170,7 @@ void ui_init() {
   init_pair(CP_SUCCESS, COLOR_GREEN, -1);
   init_pair(CP_BORDER, COLOR_CYAN, -1);
   init_pair(CP_FOOTER, COLOR_BLACK, COLOR_WHITE);
+  init_pair(CP_WIZARD, COLOR_WHITE, COLOR_BLUE); // Bold Blue Modal
 
   getmaxyx(stdscr, S_ROWS, S_COLS);
   int half = S_COLS / 2;
@@ -195,7 +182,6 @@ void ui_init() {
 
   // Top-Right stacking (Queue, Event Log)
   int q_h = 10;
-  int e_h = 17;
 
   // Bottom section height (History and Metrics)
   int b_h = S_ROWS - (HEADER_H + p_h + v_h + u_h) - FOOTER_H;
@@ -211,17 +197,20 @@ void ui_init() {
   w_updaters = newwin(u_h, half, HEADER_H + p_h + v_h, 0);
   w_updaters_in = derwin(w_updaters, u_h - 2, half - 4, 1, 2);
 
-  w_queue = newwin(q_h, S_COLS - half, HEADER_H, half);
-  w_events = newwin(e_h, S_COLS - half, HEADER_H + q_h, half);
-  w_events_in = derwin(w_events, e_h - 2, S_COLS - half - 4, 1, 2);
+  w_queue      = newwin(q_h, S_COLS - half, HEADER_H, half);
+    
+  // Event Log expanded to fill everything below Queue on the right
+  int e_h_new = S_ROWS - (HEADER_H + q_h) - FOOTER_H;
+  w_events     = newwin(e_h_new, S_COLS - half, HEADER_H + q_h, half);
+  w_events_in  = derwin(w_events, e_h_new - 2, S_COLS - half - 4, 1, 2);
 
-  HIST_START = HEADER_H + p_h + v_h + u_h;
-  w_history = newwin(b_h, half, HIST_START, 0);
+  HIST_START   = HEADER_H + p_h + v_h + u_h;
+  w_history    = newwin(b_h, half, HIST_START, 0);
   w_history_in = derwin(w_history, b_h - 3, half - 4, 2, 2);
-
-  w_metrics = newwin(b_h, S_COLS - half, HIST_START, half);
-
-  w_footer = newwin(FOOTER_H, S_COLS, S_ROWS - FOOTER_H, 0);
+    
+  w_metrics    = nullptr; // No longer showing metrics
+    
+  w_footer     = newwin(FOOTER_H, S_COLS, S_ROWS - FOOTER_H, 0);
 
   scrollok(w_events_in, TRUE);
   scrollok(w_history_in, TRUE);
@@ -232,11 +221,10 @@ void ui_init() {
   redraw_producers();
   titled_box(w_validators, "VALIDATORS", CP_VALIDATOR);
   titled_box(w_updaters, "UPDATERS", CP_UPDATER);
-  titled_box(w_queue, "BUFFER QUEUE", CP_PRODUCER);
-  titled_box(w_events, "EVENT LOG", CP_VALIDATOR);
-  titled_box(w_history, "TRANSACTION HISTORY", CP_UPDATER);
-  titled_box(w_metrics, "SYSTEM METRICS", CP_MONITOR);
-
+  titled_box(w_queue,      "BUFFER QUEUE",        CP_PRODUCER);
+  titled_box(w_events,     "EVENT LOG",           CP_VALIDATOR);
+  titled_box(w_history,    "TRANSACTION HISTORY", CP_UPDATER);
+    
   // Proper multi-window refresh
   touchwin(stdscr);
   wnoutrefresh(w_header);
@@ -246,7 +234,6 @@ void ui_init() {
   wnoutrefresh(w_queue);
   wnoutrefresh(w_events);
   wnoutrefresh(w_history);
-  wnoutrefresh(w_metrics);
   wnoutrefresh(w_footer);
   doupdate();
 
@@ -262,9 +249,8 @@ void ui_init() {
   // Footer
   wbkgd(w_footer, COLOR_PAIR(CP_FOOTER));
   wattron(w_footer, COLOR_PAIR(CP_FOOTER) | A_BOLD);
-  mvwprintw(w_footer, 0, 1,
-            "Ctrl+C: Stop  |  P=Producers  V=Validators  U=Updaters  |  "
-            "Auto-refreshes every 2s");
+  mvwprintw(w_footer, 0, 2,
+            "Ctrl+C: Stop  |  M: Manual Transaction  |  V=Validators  U=Updaters");
   wattroff(w_footer, COLOR_PAIR(CP_FOOTER) | A_BOLD);
   wrefresh(w_footer);
 
@@ -272,6 +258,17 @@ void ui_init() {
 }
 
 void ui_shutdown() {
+  if (w_header) {
+      // Show shutdown notice in the header
+      wbkgd(w_header, COLOR_PAIR(CP_ERROR));
+      werase(w_header);
+      wattron(w_header, COLOR_PAIR(CP_ERROR) | A_BOLD | A_BLINK);
+      mvwprintw(w_header, 0, (S_COLS/2)-15, "!!! SYSTEM GRACEFUL SHUTDOWN !!!");
+      wattroff(w_header, COLOR_PAIR(CP_ERROR) | A_BOLD | A_BLINK);
+     // Simulate detailed audit time (checking session, balance, etc.)
+  std::this_thread::sleep_for(std::chrono::milliseconds(300 + (rand() % 400)));
+  }
+
   if (w_header)
     delwin(w_header);
   if (w_producers)
@@ -310,13 +307,15 @@ void ui_update_header(bool auto_mode, bool manual_mode) {
   werase(w_header);
   wattron(w_header, COLOR_PAIR(CP_HEADER) | A_BOLD);
 
-  mvwprintw(w_header, 0, 1, "TRANSACTION PROCESSING SYSTEM");
-  wprintw(w_header, "   |");
-  if (auto_mode)
-    wprintw(w_header, "  Auto");
-  if (manual_mode)
-    wprintw(w_header, "  Manual");
-  wprintw(w_header, "  |  Threads: 3 producers  2 validators  2 updaters");
+  mvwprintw(w_header, 0, 1, " TRANSACTION PROCESSING SYSTEM ");
+  
+  std::string mode_str = "[ ";
+  if (auto_mode) mode_str += "AUTO ";
+  if (manual_mode) mode_str += "MANUAL [M] ";
+  mode_str += "]";
+  mvwprintw(w_header, 0, 32, "%s", mode_str.c_str());
+  wattroff(w_header, COLOR_PAIR(CP_HEADER) | A_BOLD);
+  wrefresh(w_header);
 
   // Live clock right-aligned
   time_t now = time(nullptr);
@@ -402,7 +401,7 @@ void ui_queue_pop() {
 
 // ── Event log ─────────────────────────────────────────────────
 void ui_add_log(const char *thread_type, int thread_num, const char *message,
-                const char *timestamp) {
+                const char */*timestamp*/) {
   std::lock_guard<std::mutex> lk(g_ui_mutex);
   if (!w_events_in)
     return;
@@ -459,60 +458,26 @@ void ui_add_log(const char *thread_type, int thread_num, const char *message,
   }
 
   touchwin(w_events);
-  wnoutrefresh(w_events);    // Refresh the border
-  wnoutrefresh(w_events_in); // Refresh the content
-  doupdate();
+  refresh_with_wizard(w_events, w_events_in);
 }
 
 // ── Metrics ───────────────────────────────────────────────────
-void ui_update_monitor(int snapshot_num, int buf_count, int buf_total,
-                       int /*done*/, int rejected, int pending, int processing,
-                       int committed, double tps, int deposits, int withdrawals,
-                       int transfers) {
+void ui_update_monitor(int /*snapshot_num*/, int /*buf_count*/, int /*buf_total*/,
+                       int /*done*/, int /*rejected*/, int /*pending*/, int /*processing*/,
+                       int /*committed*/, double /*tps*/, int /*deposits*/, int /*withdrawals*/,
+                       int /*transfers*/) {
   std::lock_guard<std::mutex> lk(g_ui_mutex);
-  // Don't override g_current_buf_count here to keep the live pushes/pops
-  if (!w_metrics)
-    return;
-  werase(w_metrics);
-  titled_box(w_metrics, "SYSTEM METRICS", CP_MONITOR);
-
-  redraw_queue(); // Update the queue bar whenever metrics are updated
-
-  wattron(w_metrics, COLOR_PAIR(CP_SUCCESS) | A_BOLD);
-  mvwprintw(w_metrics, 1, 2, "TPS         : %.2f", tps);
-  wattroff(w_metrics, COLOR_PAIR(CP_SUCCESS) | A_BOLD);
-
-  wattron(w_metrics, COLOR_PAIR(CP_SYSTEM));
-  mvwprintw(w_metrics, 2, 2, "Committed   : %d", committed);
-  mvwprintw(w_metrics, 3, 2, "Rejected    : %d", rejected);
-  mvwprintw(w_metrics, 4, 2, "Pending     : %d", pending);
-  mvwprintw(w_metrics, 5, 2, "Processing  : %d", processing);
-  wattroff(w_metrics, COLOR_PAIR(CP_SYSTEM));
-
-  wattron(w_metrics, COLOR_PAIR(CP_PRODUCER));
-  mvwprintw(w_metrics, 2, getmaxx(w_metrics) / 2, "Deposits    : %d", deposits);
-  wattroff(w_metrics, COLOR_PAIR(CP_PRODUCER));
-  wattron(w_metrics, COLOR_PAIR(CP_VALIDATOR));
-  mvwprintw(w_metrics, 3, getmaxx(w_metrics) / 2, "Withdrawals : %d",
-            withdrawals);
-  wattroff(w_metrics, COLOR_PAIR(CP_VALIDATOR));
-  wattron(w_metrics, COLOR_PAIR(CP_UPDATER));
-  mvwprintw(w_metrics, 4, getmaxx(w_metrics) / 2, "Transfers   : %d",
-            transfers);
-  wattroff(w_metrics, COLOR_PAIR(CP_UPDATER));
-
-  wattron(w_metrics, COLOR_PAIR(CP_SYSTEM) | A_DIM);
-  mvwprintw(w_metrics, 6, 2, "Snapshot #%d", snapshot_num);
-  wattroff(w_metrics, COLOR_PAIR(CP_SYSTEM) | A_DIM);
-
-  wrefresh(w_metrics);
-
-  // Also refresh header clock
-  time_t now = time(nullptr);
-  char ts[16];
-  strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
-  mvwprintw(w_header, 0, S_COLS - 10, "%s", ts);
-  wrefresh(w_header);
+  
+  redraw_queue(); // Keep the live bar updated
+  
+  // Refresh header clock
+  if (w_header) {
+      time_t now = time(nullptr);
+      char ts[16];
+      strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
+      mvwprintw(w_header, 0, S_COLS - 10, "%s", ts);
+      wrefresh(w_header);
+  }
 }
 
 // ── History ───────────────────────────────────────────────────
@@ -536,55 +501,115 @@ void ui_history_push(int txn_id, const char *type, double amount, bool saved) {
   wattroff(w_history_in, COLOR_PAIR(cp));
 
   touchwin(w_history);
-  wnoutrefresh(w_history);    // Refresh the border
-  wnoutrefresh(w_history_in); // Refresh the content
-  doupdate();
+  refresh_with_wizard(w_history, w_history_in);
 }
 
 // ── Wizard ────────────────────────────────────────────────────
 static void ensure_wizard() {
-  if (!w_wizard)
-    w_wizard = newwin(TOP_H, S_COLS / 2, HEADER_H, S_COLS / 4);
+  if (!w_wizard) {
+    w_wizard = newwin(10, S_COLS / 2, HEADER_H + 2, S_COLS / 4);
+    wbkgd(w_wizard, COLOR_PAIR(CP_WIZARD)); // Make it solid/opaque
+  }
 }
 
+// (Old definition removed)
+
 void ui_wizard_clear() {
-  std::lock_guard<std::mutex> lk(g_ui_mutex);
-  ensure_wizard();
-  werase(w_wizard);
-  titled_box(w_wizard, "MANUAL TRANSACTION WIZARD", CP_HEADER);
-  wrefresh(w_wizard);
+    std::lock_guard<std::mutex> lk(g_ui_mutex);
+    ensure_wizard();
+    werase(w_wizard);
+    titled_box(w_wizard, "MANUAL TRANSACTION WIZARD", CP_HEADER);
+    wrefresh(w_wizard);
+}
+
+void ui_wizard_shutdown() {
+    std::lock_guard<std::mutex> lk(g_ui_mutex);
+    if (w_wizard) {
+        delwin(w_wizard);
+        w_wizard = nullptr;
+    }
+    
+    // Force ncurses to realize the entire screen needs repainting
+    clearok(stdscr, TRUE);
+    touchwin(stdscr);
+    
+    // Refresh all major components
+    if (w_header) { touchwin(w_header); wnoutrefresh(w_header); }
+    if (w_producers) { touchwin(w_producers); wnoutrefresh(w_producers); }
+    if (w_validators) { touchwin(w_validators); wnoutrefresh(w_validators); }
+    if (w_updaters) { touchwin(w_updaters); wnoutrefresh(w_updaters); }
+    if (w_queue) { touchwin(w_queue); wnoutrefresh(w_queue); }
+    if (w_events) { touchwin(w_events); wnoutrefresh(w_events); }
+    if (w_history) { touchwin(w_history); wnoutrefresh(w_history); }
+    if (w_footer) { touchwin(w_footer); wnoutrefresh(w_footer); }
+    
+    doupdate();
+    clearok(stdscr, FALSE);
 }
 
 void ui_wizard_print(int row, int col, const char *text, int color_pair) {
   std::lock_guard<std::mutex> lk(g_ui_mutex);
   ensure_wizard();
-  if (color_pair > 0)
-    wattron(w_wizard, COLOR_PAIR(color_pair) | A_BOLD);
+  
+  // If we have a special color, we must ensure it keeps the BLUE background
+  if (color_pair == CP_SUCCESS) init_pair(20, COLOR_GREEN, COLOR_BLUE);
+  else if (color_pair == CP_ERROR) init_pair(21, COLOR_RED, COLOR_BLUE);
+  else if (color_pair == CP_PRODUCER) init_pair(22, COLOR_CYAN, COLOR_BLUE);
+  
+  int actual_cp = CP_WIZARD;
+  if (color_pair == CP_SUCCESS) actual_cp = 20;
+  else if (color_pair == CP_ERROR) actual_cp = 21;
+  else if (color_pair == CP_PRODUCER) actual_cp = 22;
+
+  wattron(w_wizard, COLOR_PAIR(actual_cp) | A_BOLD);
   mvwprintw(w_wizard, row + 1, col + 2, "%s", text);
-  if (color_pair > 0)
-    wattroff(w_wizard, COLOR_PAIR(color_pair) | A_BOLD);
+  wattroff(w_wizard, COLOR_PAIR(actual_cp) | A_BOLD);
   wrefresh(w_wizard);
 }
 
-void ui_wizard_get_string(char *buf, int max_len, const char *prompt) {
-  {
-    std::lock_guard<std::mutex> lk(g_ui_mutex);
-    ensure_wizard();
-    wattron(w_wizard, COLOR_PAIR(CP_SUCCESS));
-    mvwprintw(w_wizard, 3, 2, "%-36s", prompt);
-    mvwprintw(w_wizard, 4, 2, "> ");
-    wattroff(w_wizard, COLOR_PAIR(CP_SUCCESS));
+bool ui_wizard_get_string(char *buf, int max_len, const char *prompt) {
+  extern std::atomic<bool> g_running;
+  std::lock_guard<std::mutex> lk(g_ui_mutex);
+  ensure_wizard();
+  
+  wattron(w_wizard, COLOR_PAIR(CP_WIZARD) | A_BOLD);
+  mvwprintw(w_wizard, 8, 2, "%-36s", prompt);
+  wattroff(w_wizard, COLOR_PAIR(CP_WIZARD) | A_BOLD);
+  wrefresh(w_wizard);
+
+  echo();
+  curs_set(1);
+  nodelay(w_wizard, TRUE); // Non-blocking input
+  
+  int idx = 0;
+  buf[0] = '\0';
+
+  while (g_running.load()) {
+    int ch = wgetch(w_wizard);
+    if (ch == ERR) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        continue;
+    }
+    if (ch == '\n' || ch == '\r') {
+        buf[idx] = '\0';
+        break;
+    }
+    if (ch == 127 || ch == KEY_BACKSPACE || ch == '\b') {
+        if (idx > 0) {
+            idx--;
+            mvwaddch(w_wizard, 8, 2 + strlen(prompt) + idx, ' ');
+            wmove(w_wizard, 8, 2 + strlen(prompt) + idx);
+        }
+    } else if (idx < max_len - 1) {
+        buf[idx++] = (char)ch;
+    }
     wrefresh(w_wizard);
-    curs_set(1);
-    echo();
   }
-  wgetnstr(w_wizard, buf, max_len - 1);
-  {
-    std::lock_guard<std::mutex> lk(g_ui_mutex);
-    noecho();
-    curs_set(0);
-    wrefresh(w_wizard);
-  }
+
+  nodelay(w_wizard, FALSE);
+  noecho();
+  curs_set(0);
+  return g_running.load();
 }
 
 // ── Final report ─────────────────────────────────────────────

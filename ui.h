@@ -15,6 +15,7 @@
 #define CP_SUCCESS   8  // Bright Green on Black
 #define CP_BORDER    9  // Blue on Black
 #define CP_FOOTER   10  // Black on White  — bottom bar
+#define CP_WIZARD   11
 
 // ── Lifecycle ─────────────────────────────────────────────────
 void ui_init();
@@ -54,8 +55,9 @@ void ui_history_push(int txn_id, const char* type,
 
 // ── Wizard overlay (manual input) ────────────────────────────
 void ui_wizard_clear();
+void ui_wizard_shutdown();
 void ui_wizard_print(int row, int col, const char* text, int color_pair = 0);
-void ui_wizard_get_string(char* buf, int max_len, const char* prompt);
+bool ui_wizard_get_string(char* buf, int max_len, const char* prompt);
 
 // ── Final report (after endwin) ──────────────────────────────
 void ui_show_final_report(int generated, int done, int rejected,

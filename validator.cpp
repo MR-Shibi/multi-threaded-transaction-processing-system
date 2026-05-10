@@ -3,22 +3,22 @@
 // ============================================================
 
 #include "validator.h"
+#include "Transaction.h"
 #include "database.h"
 #include "fifo_queue.h"
 #include "logger.h"
 #include "shared_buffer.h"
-#include "transaction.h"
 #include "ui.h"
-
 
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <pthread.h>
+#include <iostream>
 #include <string>
+#include <thread>
 #include <unistd.h>
-
 
 extern std::atomic<bool> g_running;
 
@@ -146,7 +146,8 @@ void *validator_thread(void *args) {
 
   // ── Open per-thread DB connection (Tier 2) ───────────────
   // This connection is exclusively owned by this thread.
-  // No mutex is needed for reads (session, balance).
+  // Simulate detailed audit time (checking session, balance, etc.)
+  std::this_thread::sleep_for(std::chrono::milliseconds(300 + (rand() % 400)));
   sqlite3 *conn = db_open_connection();
   if (!conn) {
     logger_log(ThreadType::VALIDATOR, id,
@@ -173,7 +174,9 @@ void *validator_thread(void *args) {
     }
 
     db_update_raw_status(txn.transaction_id, "PROCESSING");
-    char val_st[72]; snprintf(val_st, 72, "Auditing #%d (%s)", txn.transaction_id, txn.transaction_type);
+    char val_st[72];
+    snprintf(val_st, 72, "Auditing #%d (%s)", txn.transaction_id,
+             txn.transaction_type);
     ui_set_thread_status("VALIDATOR", id, val_st);
     if (g_running.load())
       usleep(TRANSITION_DELAY_US);
@@ -259,7 +262,9 @@ void *validator_thread(void *args) {
         "                                  └─ [ACCEPTED] Generated atomic SQL. "
         "Forwarded to Updater.";
     logger_log(ThreadType::VALIDATOR, id, log);
-    char ok_st[72]; snprintf(ok_st, 72, "Forwarded #%d  ok:%d  rej:%d", txn.transaction_id, validated, rejected);
+    char ok_st[72];
+    snprintf(ok_st, 72, "Forwarded #%d  ok:%d  rej:%d", txn.transaction_id,
+             validated, rejected);
     ui_set_thread_status("VALIDATOR", id, ok_st);
   }
 

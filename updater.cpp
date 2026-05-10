@@ -13,6 +13,7 @@
 
 extern std::atomic<bool> g_running;
 #include <cstdio>
+#include <thread>
 #include <unistd.h>
 #include <string>
 
@@ -85,6 +86,8 @@ void* updater_thread(void* args) {
                     + " of $" + std::to_string((int)amount)
                     + "  |  Total saved today: "
                     + std::to_string(committed);
+                // Simulate "Disk I/O" or DB overhead
+                std::this_thread::sleep_for(std::chrono::milliseconds(200 + (rand() % 300)));
                 ui_history_push(txn_id, type, amount, true);
                 char st[72]; snprintf(st, 72, "Saved #%d (%s $%.0f)  total:%d", txn_id, type, amount, committed);
                 ui_set_thread_status("UPDATER", id, st);
