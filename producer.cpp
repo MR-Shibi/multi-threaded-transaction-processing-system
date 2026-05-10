@@ -216,8 +216,13 @@ void *manual_producer_thread(void *args) {
                 // Step 3: Amount
                 double amt = -1;
                 while (g_running.load()) {
+                    double current_balance = db_get_balance_global(USERS[user_idx].id);
+                    char bal_line[64];
+                    snprintf(bal_line, 64, "Current Balance: $%.2f", current_balance);
+
                     ui_wizard_clear();
                     ui_wizard_print(0, 0, "ENTER AMOUNT:", CP_HEADER);
+                    ui_wizard_print(1, 0, bal_line, CP_PRODUCER);
                     if (!wizard_read_line("Amount $: ", line, sizeof(line)) || is_quit(line)) break;
                     
                     char* endptr;
