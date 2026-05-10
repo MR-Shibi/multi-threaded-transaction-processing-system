@@ -17,6 +17,7 @@
 #include <string>
 
 extern std::atomic<bool> g_running;
+extern std::atomic<bool> g_input_active;
 
 void* monitor_thread(void* args) {
     MonitorArgs*        a   = static_cast<MonitorArgs*>(args);
@@ -64,7 +65,7 @@ void* monitor_thread(void* args) {
                        (pending > 0) || (processing > 0) || (buf_count > 0);
 
         if (changed) {
-            ui_print_monitor_snapshot(
+            ui_update_monitor(
                 snapshot_num,
                 buf_count, SHARED_BUFFER_SIZE,
                 done, rejected, pending, processing,
@@ -97,7 +98,7 @@ void* monitor_thread(void* args) {
         int fw1 = db_count_raw_by_type("WITHDRAWAL");
         int ft1 = db_count_raw_by_type("TRANSFER");
 
-        ui_print_monitor_snapshot(
+        ui_update_monitor(
             snapshot_num + 1,
             fb, SHARED_BUFFER_SIZE,
             fd, fr, fp, fc, fm, 0.0,

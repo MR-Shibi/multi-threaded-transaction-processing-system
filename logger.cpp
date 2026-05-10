@@ -49,16 +49,12 @@ static void print_message(const LogMessage& msg) {
     char time_buf[16];
     format_time(msg.timestamp, time_buf, sizeof(time_buf));
 
-    // Use the UI formatter for colored output
-    std::string line = ui_format_log(
+    ui_add_log(
         type_str(msg.thread_type),
         msg.thread_num,
         msg.text.c_str(),
         time_buf
     );
-
-    printf("%s\n", line.c_str());
-    fflush(stdout);
 }
 
 // ── Logger thread ─────────────────────────────────────────────
@@ -69,13 +65,7 @@ static void* logger_thread_func(void*) {
     struct tm* tm_info = localtime(&now);
     strftime(now_buf, sizeof(now_buf), "%H:%M:%S", tm_info);
 
-    std::string start_line = ui_format_log(
-        "SYSTEM", 0,
-        "System logger started. All output is managed centrally.",
-        now_buf
-    );
-    printf("%s\n", start_line.c_str());
-    fflush(stdout);
+    ui_add_log("SYSTEM", 0, "System logger started. All output is managed centrally.", now_buf);
 
     while (true) {
         sem_wait(&g_queue_sem);
@@ -107,13 +97,7 @@ static void* logger_thread_func(void*) {
             time_t fn = time(nullptr);
             struct tm* fti = localtime(&fn);
             strftime(flush_buf, sizeof(flush_buf), "%H:%M:%S", fti);
-            std::string done_line = ui_format_log(
-                "SYSTEM", 0,
-                "All log messages have been delivered. Logger closing.",
-                flush_buf
-            );
-            printf("%s\n", done_line.c_str());
-            fflush(stdout);
+            ui_add_log("SYSTEM", 0, "All log messages have been delivered. Logger closing.", flush_buf);
             break;
         }
 

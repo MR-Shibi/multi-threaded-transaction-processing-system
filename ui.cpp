@@ -1,1016 +1,603 @@
-// ============================================================
-//  ui.cpp — Terminal UI System
-//  - Human-readable log messages
-//  - Transfer recipient wizard step
-//  - Fixed WARNING false alarm (only shows when truly stuck)
-//  - Choice prompt no longer duplicates
-// ============================================================
-
 #include "ui.h"
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <mutex>
+#include <ncurses.h>
 #include <string>
-#include <unistd.h>
-#include "database.h"
+#include <vector>
 
-static const int W = UI_WIDTH;
+std::mutex g_ui_mutex;
 
-// ============================================================
-//  UTILITY
-// ============================================================
-std::string ui_repeat(const char* s, int n) {
-    if (n <= 0) return "";
-    std::string r;
-    for (int i = 0; i < n; i++) r += s;
-    return r;
+// ── Layout ───────────────────────────────────────────────────
+// Row 0-1      : Header bar
+// Row 2..TOP   : Pipeline Status (left) | Buffer Queue (right)
+// Row TOP..MID : Metrics (left)         | Event Log (right)
+// Row MID..H-2 : Transaction History (full width)
+// Row H-1      : Footer hints
+static const int HEADER_H = 2;
+static const int TOP_H = 11;
+static const int MID_H = 8;
+static const int FOOTER_H = 1;
+
+static int S_ROWS = 0, S_COLS = 0;
+static int HIST_START = 0;
+
+static WINDOW *w_header = nullptr;
+static WINDOW *w_producers = nullptr;
+static WINDOW *w_validators = nullptr;
+static WINDOW *w_validators_in = nullptr;
+static WINDOW *w_updaters = nullptr;
+static WINDOW *w_updaters_in = nullptr;
+static WINDOW *w_metrics = nullptr;
+static WINDOW *w_queue = nullptr;
+static WINDOW *w_events = nullptr;
+static WINDOW *w_events_in = nullptr;
+static WINDOW *w_history = nullptr;
+static WINDOW *w_history_in = nullptr;
+static WINDOW *w_footer = nullptr;
+static WINDOW *w_wizard = nullptr;
+
+// ── Per-thread status storage ────────────────────────────────
+static char g_prod_st[4][72] = {};
+static char g_val_st[2][72] = {};
+static char g_upd_st[2][72] = {};
+
+// ── Queue entries ─────────────────────────────────────────────
+struct QEntry {
+  int id;
+  char user[20];
+  char type[12];
+  double amount;
+};
+static QEntry g_qbuf[32];
+static int g_qcount = 0;
+
+// ── History rows ─────────────────────────────────────────────
+struct HEntry {
+  int id;
+  char type[12];
+  double amount;
+  char status[8];
+  char ts[10];
+};
+static std::vector<HEntry> g_hist;
+
+static int g_current_buf_count = 0;
+
+// ── Helpers ──────────────────────────────────────────────────
+static void titled_box(WINDOW *w, const char *title, int cp) {
+  wattron(w, COLOR_PAIR(CP_BORDER));
+  box(w, 0, 0);
+  wattroff(w, COLOR_PAIR(CP_BORDER));
+  if (title) {
+    wattron(w, COLOR_PAIR(cp) | A_BOLD);
+    mvwprintw(w, 0, 2, " %s ", title);
+    wattroff(w, COLOR_PAIR(cp) | A_BOLD);
+  }
 }
 
-std::string ui_fixed(const std::string& s, int width) {
-    if (width <= 0) return "";
-    if ((int)s.size() >= width) return s.substr(0, width);
-    return s + std::string(width - s.size(), ' ');
+// ── Redraw Thread Sections ────────────────────────────────────
+static void redraw_producers() {
+  if (!w_producers)
+    return;
+  werase(w_producers);
+  titled_box(w_producers, "PRODUCERS", CP_PRODUCER);
+  for (int i = 0; i < 4; i++) {
+    if (!g_prod_st[i][0])
+      continue;
+    wattron(w_producers, COLOR_PAIR(CP_PRODUCER));
+    mvwprintw(w_producers, i + 1, 2, "P-%d: %s", i + 1, g_prod_st[i]);
+    wattroff(w_producers, COLOR_PAIR(CP_PRODUCER));
+  }
+  wrefresh(w_producers);
 }
 
-void ui_rule(const char* color) {
-    printf("%s%s%s\n", color, ui_repeat("─", W).c_str(), ANSI_RESET);
-    fflush(stdout);
+static void redraw_validators() {
+  if (!w_validators)
+    return;
+  werase(w_validators);
+  titled_box(w_validators, "VALIDATORS", CP_VALIDATOR);
+  for (int i = 0; i < 2; i++) {
+    if (!g_val_st[i][0])
+      continue;
+    wattron(w_validators, COLOR_PAIR(CP_VALIDATOR));
+    mvwprintw(w_validators, i + 1, 2, "V-%d: %s", i + 1, g_val_st[i]);
+    wattroff(w_validators, COLOR_PAIR(CP_VALIDATOR));
+  }
+  wrefresh(w_validators);
 }
 
-void ui_clear_line() {
-    printf("\r\033[2K");
-    fflush(stdout);
+static void redraw_updaters() {
+  if (!w_updaters)
+    return;
+  werase(w_updaters);
+  titled_box(w_updaters, "UPDATERS", CP_UPDATER);
+  for (int i = 0; i < 2; i++) {
+    if (!g_upd_st[i][0])
+      continue;
+    wattron(w_updaters, COLOR_PAIR(CP_UPDATER));
+    mvwprintw(w_updaters, i + 1, 2, "U-%d: %s", i + 1, g_upd_st[i]);
+    wattroff(w_updaters, COLOR_PAIR(CP_UPDATER));
+  }
+  wrefresh(w_updaters);
 }
 
-// ============================================================
-//  INTERNAL BOX HELPERS
-// ============================================================
-static void box_top_titled(const char* title,
-                            const char* border_color = ANSI_BR_BLACK) {
-    int inner = W - 2;
-    int t_vis = (int)strlen(title);
-    int left  = (inner - t_vis) / 2;
-    int right = inner - t_vis - left;
-    if (left  < 0) left  = 0;
-    if (right < 0) right = 0;
-    printf("%s%s%s%s%s%s%s%s%s%s%s\n",
-           ANSI_BOLD, border_color,
-           BOX_TL, ui_repeat(BOX_H, left).c_str(),
-           ANSI_RESET, ANSI_BOLD, ANSI_BR_WHITE, title,
-           ANSI_RESET, ANSI_BOLD, border_color,
-           ui_repeat(BOX_H, right).c_str(), BOX_TR, ANSI_RESET);
-}
+// ── Redraw queue panel ────────────────────────────────────────
+static void redraw_queue() {
+  if (!w_queue)
+    return;
+  werase(w_queue);
 
-static void box_divider(const char* border_color = ANSI_BR_BLACK) {
-    printf("%s%s%s%s%s%s\n",
-           ANSI_BOLD, border_color,
-           BOX_ML, ui_repeat(BOX_H, W - 2).c_str(), BOX_MR, ANSI_RESET);
-}
+  char title[48];
+  snprintf(title, sizeof(title), "BUFFER QUEUE  Live: %d slots",
+           g_current_buf_count);
+  titled_box(w_queue, title, CP_PRODUCER);
 
-static void box_bottom(const char* border_color = ANSI_BR_BLACK) {
-    printf("%s%s%s%s%s%s\n",
-           ANSI_BOLD, border_color,
-           BOX_BL, ui_repeat(BOX_H, W - 2).c_str(), BOX_BR, ANSI_RESET);
-}
-
-static void box_blank(const char* border_color = ANSI_BR_BLACK) {
-    printf("%s%s%s%s%s%s\n",
-           ANSI_BOLD, border_color, BOX_V,
-           std::string(W - 2, ' ').c_str(),
-           BOX_V, ANSI_RESET);
-}
-
-static void box_row_lv(const char* label, const char* value,
-                        const char* label_color, const char* value_color,
-                        const char* border_color = ANSI_BR_BLACK) {
-    int llen = (int)strlen(label);
-    int vlen = (int)strlen(value);
-    int pad  = (W - 4) - llen - vlen;
-    if (pad < 0) pad = 0;
-    printf("%s%s%s  %s%s%s%s%s%s%s%s%s\n",
-           ANSI_BOLD, border_color, BOX_V, ANSI_RESET,
-           ANSI_BOLD, label_color, label, ANSI_RESET,
-           std::string(pad, ' ').c_str(),
-           ANSI_BOLD, value_color, value, ANSI_RESET,
-           ANSI_BOLD, border_color, BOX_V, ANSI_RESET);
-}
-
-static void box_row_center(const char* text, const char* color,
-                            const char* border_color = ANSI_BR_BLACK) {
-    int tlen  = (int)strlen(text);
-    int inner = W - 4;
-    int lpad  = (inner - tlen) / 2;
-    int rpad  = inner - tlen - lpad;
-    if (lpad < 0) lpad = 0;
-    if (rpad < 0) rpad = 0;
-    printf("%s%s%s  %s%s%s%s%s%s%s%s\n",
-           ANSI_BOLD, border_color, BOX_V, ANSI_RESET,
-           std::string(lpad, ' ').c_str(),
-           ANSI_BOLD, color, text, ANSI_RESET,
-           std::string(rpad, ' ').c_str(),
-           ANSI_BOLD, border_color, BOX_V, ANSI_RESET);
-}
-
-// ============================================================
-//  ui_print_banner()
-// ============================================================
-void ui_print_banner(bool auto_mode, bool manual_mode) {
-    printf("\n");
-    box_top_titled(" Multi-Threaded Transaction Processing System ",
-                   ANSI_BR_WHITE);
-
-    {
-        const char* sub = "OS Project  -  Full System Integration";
-        int vis = (int)strlen(sub);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, ANSI_BR_WHITE, BOX_V, ANSI_RESET,
-               ANSI_DIM, ANSI_WHITE, sub,
-               std::string(pad, ' ').c_str(),
-               ANSI_RESET, ANSI_BOLD, ANSI_BR_WHITE, BOX_V, ANSI_RESET);
+  // Visual bar at top (show live count vs 8 slots)
+  wattron(w_queue, COLOR_PAIR(CP_SYSTEM));
+  mvwprintw(w_queue, 1, 2, "[");
+  for (int i = 0; i < 8; i++) {
+    if (i < g_current_buf_count) {
+      wattron(w_queue, COLOR_PAIR(CP_PRODUCER) | A_BOLD);
+      waddch(w_queue, '#');
+      wattroff(w_queue, COLOR_PAIR(CP_PRODUCER) | A_BOLD);
+    } else {
+      wattron(w_queue, COLOR_PAIR(CP_SYSTEM) | A_DIM);
+      waddch(w_queue, '.');
+      wattroff(w_queue, COLOR_PAIR(CP_SYSTEM) | A_DIM);
     }
+  }
+  wattron(w_queue, COLOR_PAIR(CP_SYSTEM));
+  wprintw(w_queue, "] %d/8", g_current_buf_count);
+  wattroff(w_queue, COLOR_PAIR(CP_SYSTEM));
 
-    box_divider(ANSI_BR_WHITE);
-    box_blank(ANSI_BR_WHITE);
-
-    auto pipe_row = [&](const char* label, const char* lc, const char* detail) {
-        int lpad = 18 - (int)strlen(label);
-        if (lpad < 0) lpad = 0;
-        int vis = 18 + 2 + (int)strlen(detail);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, ANSI_BR_WHITE, BOX_V, ANSI_RESET,
-               ANSI_BOLD, lc, label, ANSI_RESET,
-               std::string(lpad, ' ').c_str(),
-               ANSI_DIM, ANSI_WHITE, detail,
-               std::string(pad, ' ').c_str(),
-               ANSI_RESET, ANSI_BOLD, ANSI_BR_WHITE, BOX_V, ANSI_RESET);
-    };
-
-    auto arrow_row = [&](const char* text) {
-        int vis = 9 + (int)strlen(text);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, ANSI_BR_WHITE, BOX_V, ANSI_RESET,
-               ANSI_BR_BLACK, "         ", text,
-               std::string(pad, ' ').c_str(),
-               ANSI_RESET, ANSI_BOLD, ANSI_BR_WHITE, BOX_V, ANSI_RESET);
-    };
-
-    if (auto_mode)
-        pipe_row("PRODUCER [AUTO]",   UI_COLOR_PRODUCER,
-                 "SLOW · FAST · BURST modes");
-    if (manual_mode)
-        pipe_row("PRODUCER [MANUAL]", UI_COLOR_PRODUCER,
-                 "Step-by-step guided input");
-
-    arrow_row("v  [Shared Memory]  /dev/shm/txn_shared_buffer");
-    arrow_row("   Circular buffer  8 slots  sem + mutex sync");
-    pipe_row("VALIDATOR",          UI_COLOR_VALIDATOR,
-             "Session  Balance  SQL build");
-    arrow_row("v  [Named Pipe FIFO]  /tmp/txn_query_pipe");
-    arrow_row("   512-byte atomic SQL messages");
-    pipe_row("DB UPDATER",         UI_COLOR_UPDATER,
-             "BEGIN  INSERT + UPDATE  COMMIT");
-    arrow_row("v  [SQLite3 WAL]  transactions.db");
-
-    box_blank(ANSI_BR_WHITE);
-    box_divider(ANSI_BR_WHITE);
-
-    pipe_row("LOGGER",  UI_COLOR_SYSTEM,  "Sole stdout owner  async queue");
-    pipe_row("MONITOR", UI_COLOR_MONITOR, "Read-only  2s interval  live panels");
-
-    box_blank(ANSI_BR_WHITE);
-    box_divider(ANSI_BR_WHITE);
-
-    {
-        const char* ctrl = "Ctrl+C  =>  graceful shutdown";
-        int vis = (int)strlen(ctrl);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, ANSI_BR_WHITE, BOX_V, ANSI_RESET,
-               ANSI_BR_WHITE, ctrl,
-               std::string(pad, ' ').c_str(),
-               ANSI_RESET, ANSI_BOLD, ANSI_BR_WHITE, BOX_V, ANSI_RESET);
-    }
-    if (manual_mode) {
-        const char* fmt = "Manual mode: step-by-step guided wizard";
-        int vis = (int)strlen(fmt);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, ANSI_BR_WHITE, BOX_V, ANSI_RESET,
-               ANSI_DIM, ANSI_WHITE, fmt,
-               std::string(pad, ' ').c_str(),
-               ANSI_RESET, ANSI_BOLD, ANSI_BR_WHITE, BOX_V, ANSI_RESET);
-    }
-
-    box_blank(ANSI_BR_WHITE);
-    box_bottom(ANSI_BR_WHITE);
-    printf("\n");
-    fflush(stdout);
+  int max_r = getmaxy(w_queue) - 1;
+  int start = g_qcount > (max_r - 2) ? g_qcount - (max_r - 2) : 0;
+  for (int i = start, r = 2; i < g_qcount && r < max_r; i++, r++) {
+    QEntry &e = g_qbuf[i % 32];
+    wattron(w_queue, COLOR_PAIR(CP_VALIDATOR));
+    mvwprintw(w_queue, r, 2, "#%-4d %-10s %-10s $%.0f", e.id, e.user, e.type,
+              e.amount);
+    wattroff(w_queue, COLOR_PAIR(CP_VALIDATOR));
+  }
+  wrefresh(w_queue);
 }
 
-// ============================================================
-//  WIZARD STEP 1 — Select User
-// ============================================================
-void ui_wizard_show_users() {
-    const char* bc = UI_COLOR_PRODUCER;
-    printf("\n");
-    box_top_titled(" STEP 1 of 3 — Who is making this transaction? ", bc);
-    box_blank(bc);
+// ────────────────────────────────────────────────────────────
+void ui_init() {
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  curs_set(0);
+  start_color();
+  use_default_colors();
 
-    struct { int id; const char* name; const char* bal; bool active; } users[] = {
-        {1, "Alice",   "$1,500", true},
-        {2, "Bob",     "$2,200", true},
-        {3, "Charlie", "$800",   true},
-        {4, "Diana",   "$3,100", true},
-        {5, "Eve",     "$500",   false},
-    };
+  init_pair(CP_HEADER, COLOR_WHITE, COLOR_CYAN);
+  init_pair(CP_PRODUCER, COLOR_CYAN, -1);
+  init_pair(CP_VALIDATOR, COLOR_YELLOW, -1);
+  init_pair(CP_UPDATER, COLOR_GREEN, -1);
+  init_pair(CP_MONITOR, COLOR_MAGENTA, -1);
+  init_pair(CP_SYSTEM, COLOR_WHITE, -1);
+  init_pair(CP_ERROR, COLOR_RED, -1);
+  init_pair(CP_SUCCESS, COLOR_GREEN, -1);
+  init_pair(CP_BORDER, COLOR_CYAN, -1);
+  init_pair(CP_FOOTER, COLOR_BLACK, COLOR_WHITE);
 
-    for (int i = 0; i < 5; i++) {
-        double balance = db_get_balance_global(users[i].id);
-        char bal_str[32];
-        if (balance >= 0) {
-            snprintf(bal_str, sizeof(bal_str), "$%.2f", balance);
-        } else {
-            snprintf(bal_str, sizeof(bal_str), "ERROR");
-        }
+  getmaxyx(stdscr, S_ROWS, S_COLS);
+  int half = S_COLS / 2;
 
-        char num[4];   snprintf(num, sizeof(num), "[%d]", users[i].id);
-        char nb[64];   snprintf(nb, sizeof(nb), "%-10s  %s",
-                                users[i].name, bal_str);
+  // Top-Left stacking (Producers, Validators, Updaters)
+  int p_h = 5;
+  int v_h = 11;
+  int u_h = 11;
 
-        const char* status     = users[i].active
-                               ? "Logged In " : "Logged Out";
-        const char* status_col = users[i].active
-                               ? ANSI_BR_GREEN : ANSI_BR_RED;
-        const char* name_col   = users[i].active
-                               ? ANSI_BR_WHITE : ANSI_BR_BLACK;
+  // Top-Right stacking (Queue, Event Log)
+  int q_h = 10;
+  int e_h = 17;
 
-        int vis = 4 + 1 + (int)strlen(nb) + 2 + (int)strlen(status);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
+  // Bottom section height (History and Metrics)
+  int b_h = S_ROWS - (HEADER_H + p_h + v_h + u_h) - FOOTER_H;
+  if (b_h < 6)
+    b_h = 6;
 
-        printf("%s%s%s  %s%s%s %s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET,
-               ANSI_BOLD, ANSI_BR_CYAN, num, ANSI_RESET,
-               ANSI_BOLD, name_col, nb, ANSI_RESET,
-               std::string(pad, ' ').c_str(),
-               ANSI_BOLD, status_col, status, ANSI_RESET,
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET);
-    }
+  w_header = newwin(HEADER_H, S_COLS, 0, 0);
 
-    box_blank(bc);
-    box_divider(bc);
-    {
-        const char* hint = "  Enter a number from 1 to 5 and press Enter:";
-        int vis = (int)strlen(hint);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET,
-               ANSI_DIM, ANSI_WHITE, hint,
-               std::string(pad, ' ').c_str(),
-               ANSI_RESET, ANSI_BOLD, bc, BOX_V, ANSI_RESET);
-    }
-    box_bottom(bc);
-    printf("\n");
-    fflush(stdout);
+  w_producers = newwin(p_h, half, HEADER_H, 0);
+  w_validators = newwin(v_h, half, HEADER_H + p_h, 0);
+  w_validators_in = derwin(w_validators, v_h - 2, half - 4, 1, 2);
+
+  w_updaters = newwin(u_h, half, HEADER_H + p_h + v_h, 0);
+  w_updaters_in = derwin(w_updaters, u_h - 2, half - 4, 1, 2);
+
+  w_queue = newwin(q_h, S_COLS - half, HEADER_H, half);
+  w_events = newwin(e_h, S_COLS - half, HEADER_H + q_h, half);
+  w_events_in = derwin(w_events, e_h - 2, S_COLS - half - 4, 1, 2);
+
+  HIST_START = HEADER_H + p_h + v_h + u_h;
+  w_history = newwin(b_h, half, HIST_START, 0);
+  w_history_in = derwin(w_history, b_h - 3, half - 4, 2, 2);
+
+  w_metrics = newwin(b_h, S_COLS - half, HIST_START, half);
+
+  w_footer = newwin(FOOTER_H, S_COLS, S_ROWS - FOOTER_H, 0);
+
+  scrollok(w_events_in, TRUE);
+  scrollok(w_history_in, TRUE);
+  scrollok(w_validators_in, TRUE);
+  scrollok(w_updaters_in, TRUE);
+
+  // Initial borders - Force draw on parent windows
+  redraw_producers();
+  titled_box(w_validators, "VALIDATORS", CP_VALIDATOR);
+  titled_box(w_updaters, "UPDATERS", CP_UPDATER);
+  titled_box(w_queue, "BUFFER QUEUE", CP_PRODUCER);
+  titled_box(w_events, "EVENT LOG", CP_VALIDATOR);
+  titled_box(w_history, "TRANSACTION HISTORY", CP_UPDATER);
+  titled_box(w_metrics, "SYSTEM METRICS", CP_MONITOR);
+
+  // Proper multi-window refresh
+  touchwin(stdscr);
+  wnoutrefresh(w_header);
+  wnoutrefresh(w_producers);
+  wnoutrefresh(w_validators);
+  wnoutrefresh(w_updaters);
+  wnoutrefresh(w_queue);
+  wnoutrefresh(w_events);
+  wnoutrefresh(w_history);
+  wnoutrefresh(w_metrics);
+  wnoutrefresh(w_footer);
+  doupdate();
+
+  // History column headers
+  wattron(w_history_in, COLOR_PAIR(CP_SYSTEM) | A_BOLD | A_UNDERLINE);
+  mvwprintw(w_history_in, 0, 0, "%-6s %-12s %10s", "TXN#", "TYPE", "AMOUNT");
+  wattroff(w_history_in, COLOR_PAIR(CP_SYSTEM) | A_BOLD | A_UNDERLINE);
+
+  touchwin(w_history);
+  wnoutrefresh(w_history_in);
+  doupdate();
+
+  // Footer
+  wbkgd(w_footer, COLOR_PAIR(CP_FOOTER));
+  wattron(w_footer, COLOR_PAIR(CP_FOOTER) | A_BOLD);
+  mvwprintw(w_footer, 0, 1,
+            "Ctrl+C: Stop  |  P=Producers  V=Validators  U=Updaters  |  "
+            "Auto-refreshes every 2s");
+  wattroff(w_footer, COLOR_PAIR(CP_FOOTER) | A_BOLD);
+  wrefresh(w_footer);
+
+  refresh();
 }
 
-// ============================================================
-//  WIZARD STEP 2 — Select Transaction Type
-// ============================================================
-void ui_wizard_show_types(int user_id, const char* user_name) {
-    const char* bc = UI_COLOR_VALIDATOR;
-    printf("\n");
-    box_top_titled(" STEP 2 of 3 — What kind of transaction? ", bc);
-    box_blank(bc);
-
-    char user_line[48];
-    snprintf(user_line, sizeof(user_line),
-             "Account holder: [%d] %s", user_id, user_name);
-    box_row_center(user_line, ANSI_BR_CYAN, bc);
-    box_blank(bc);
-    box_divider(bc);
-    box_blank(bc);
-
-    struct { int num; const char* label; const char* desc; const char* col; }
-    types[] = {
-        {1, "DEPOSIT",    "Add money into your account",     ANSI_BR_GREEN},
-        {2, "WITHDRAWAL", "Take money out of your account",  ANSI_BR_YELLOW},
-        {3, "TRANSFER",   "Send money to another account",   ANSI_BR_CYAN},
-    };
-
-    for (int i = 0; i < 3; i++) {
-        char num[4]; snprintf(num, sizeof(num), "[%d]", types[i].num);
-        int vis = 4 + 1 + 12 + 2 + (int)strlen(types[i].desc);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-
-        printf("%s%s%s  %s%s%s %s%s%-12s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET,
-               ANSI_BOLD, ANSI_BR_CYAN, num, ANSI_RESET,
-               ANSI_BOLD, types[i].col, types[i].label, ANSI_RESET,
-               std::string(pad, ' ').c_str(),
-               ANSI_DIM, ANSI_WHITE, types[i].desc, ANSI_RESET,
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET);
-        box_blank(bc);
-    }
-
-    box_divider(bc);
-    {
-        const char* hint = "  Enter 1, 2, or 3 and press Enter:";
-        int vis = (int)strlen(hint);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET,
-               ANSI_DIM, ANSI_WHITE, hint,
-               std::string(pad, ' ').c_str(),
-               ANSI_RESET, ANSI_BOLD, bc, BOX_V, ANSI_RESET);
-    }
-    box_bottom(bc);
-    printf("\n");
-    fflush(stdout);
+void ui_shutdown() {
+  if (w_header)
+    delwin(w_header);
+  if (w_producers)
+    delwin(w_producers);
+  if (w_validators_in)
+    delwin(w_validators_in);
+  if (w_validators)
+    delwin(w_validators);
+  if (w_updaters_in)
+    delwin(w_updaters_in);
+  if (w_updaters)
+    delwin(w_updaters);
+  if (w_metrics)
+    delwin(w_metrics);
+  if (w_events_in)
+    delwin(w_events_in);
+  if (w_events)
+    delwin(w_events);
+  if (w_history_in)
+    delwin(w_history_in);
+  if (w_history)
+    delwin(w_history);
+  if (w_footer)
+    delwin(w_footer);
+  if (w_wizard)
+    delwin(w_wizard);
+  endwin();
 }
 
-// ============================================================
-//  WIZARD STEP 2b — Select Transfer Recipient (TRANSFER only)
-// ============================================================
-void ui_wizard_show_transfer_recipient(int sender_id,
-                                        const char* sender_name) {
-    const char* bc = ANSI_BR_BLUE;
-    printf("\n");
-    box_top_titled(" STEP 2b — Who are you sending money TO? ", bc);
-    box_blank(bc);
+// ── Header ───────────────────────────────────────────────────
+void ui_update_header(bool auto_mode, bool manual_mode) {
+  std::lock_guard<std::mutex> lk(g_ui_mutex);
+  if (!w_header)
+    return;
+  wbkgd(w_header, COLOR_PAIR(CP_HEADER));
+  werase(w_header);
+  wattron(w_header, COLOR_PAIR(CP_HEADER) | A_BOLD);
 
-    char from_line[64];
-    snprintf(from_line, sizeof(from_line),
-             "Sending FROM: [%d] %s", sender_id, sender_name);
-    box_row_center(from_line, ANSI_BR_CYAN, bc);
-    box_blank(bc);
-    box_divider(bc);
-    box_blank(bc);
+  mvwprintw(w_header, 0, 1, "TRANSACTION PROCESSING SYSTEM");
+  wprintw(w_header, "   |");
+  if (auto_mode)
+    wprintw(w_header, "  Auto");
+  if (manual_mode)
+    wprintw(w_header, "  Manual");
+  wprintw(w_header, "  |  Threads: 3 producers  2 validators  2 updaters");
 
-    struct { int id; const char* name; const char* bal; bool active; } users[] = {
-        {1, "Alice",   "$1,500", true},
-        {2, "Bob",     "$2,200", true},
-        {3, "Charlie", "$800",   true},
-        {4, "Diana",   "$3,100", true},
-        {5, "Eve",     "$500",   false},
-    };
+  // Live clock right-aligned
+  time_t now = time(nullptr);
+  char ts[16];
+  strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
+  mvwprintw(w_header, 0, S_COLS - 10, "%s", ts);
 
-    for (int i = 0; i < 5; i++) {
-        // Cannot transfer to yourself
-        if (users[i].id == sender_id) continue;
-
-        double balance = db_get_balance_global(users[i].id);
-        char bal_str[32];
-        if (balance >= 0) {
-            snprintf(bal_str, sizeof(bal_str), "$%.2f", balance);
-        } else {
-            snprintf(bal_str, sizeof(bal_str), "ERROR");
-        }
-
-        char num[4]; snprintf(num, sizeof(num), "[%d]", users[i].id);
-        char nb[64]; snprintf(nb, sizeof(nb), "%-10s  %s",
-                              users[i].name, bal_str);
-
-        const char* name_col = users[i].active
-                             ? ANSI_BR_WHITE : ANSI_BR_BLACK;
-
-        int vis = 4 + 1 + (int)strlen(nb);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-
-        printf("%s%s%s  %s%s%s %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET,
-               ANSI_BOLD, ANSI_BR_CYAN, num, ANSI_RESET,
-               ANSI_BOLD, name_col, nb, ANSI_RESET,
-               std::string(pad, ' ').c_str(),
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET);
-    }
-
-    box_blank(bc);
-    box_divider(bc);
-    {
-        const char* hint = "  Enter a recipient number and press Enter:";
-        int vis = (int)strlen(hint);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET,
-               ANSI_DIM, ANSI_WHITE, hint,
-               std::string(pad, ' ').c_str(),
-               ANSI_RESET, ANSI_BOLD, bc, BOX_V, ANSI_RESET);
-    }
-    box_bottom(bc);
-    printf("\n");
-    fflush(stdout);
+  wattroff(w_header, COLOR_PAIR(CP_HEADER) | A_BOLD);
+  wrefresh(w_header);
 }
 
-// ============================================================
-//  WIZARD STEP 3 — Enter Amount
-// ============================================================
-void ui_wizard_show_amount(int user_id, const char* user_name,
-                            const char* txn_type,
-                            double current_balance,
-                            int recipient_id,
-                            const char* recipient_name) {
-    const char* bc = UI_COLOR_UPDATER;
-    printf("\n");
-    box_top_titled(" STEP 3 of 3 — How much money? ", bc);
-    box_blank(bc);
+// ── Pipeline status ───────────────────────────────────────────
+void ui_set_thread_status(const char *type, int num, const char *status) {
+  std::lock_guard<std::mutex> lk(g_ui_mutex);
+  int idx = num - 1;
 
-    char sum_line[64];
-    snprintf(sum_line, sizeof(sum_line),
-             "Account holder: [%d] %s", user_id, user_name);
-    box_row_center(sum_line, ANSI_BR_CYAN, bc);
+  time_t now = time(nullptr);
+  char ts[10];
+  strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
 
-    // Show recipient line only for TRANSFER
-    if (recipient_id > 0 && recipient_name != nullptr) {
-        char rec_line[64];
-        snprintf(rec_line, sizeof(rec_line),
-                 "Sending to:     [%d] %s", recipient_id, recipient_name);
-        box_row_center(rec_line, ANSI_BR_BLUE, bc);
+  if (strcmp(type, "PRODUCER") == 0 && idx >= 0 && idx < 4) {
+    snprintf(g_prod_st[idx], 72, "%s", status);
+    redraw_producers();
+  } else if (strcmp(type, "VALIDATOR") == 0 && idx >= 0 && idx < 2) {
+    if (w_validators_in) {
+      wattron(w_validators_in, COLOR_PAIR(CP_SYSTEM) | A_DIM);
+      wprintw(w_validators_in, "[%s] ", ts);
+      wattroff(w_validators_in, COLOR_PAIR(CP_SYSTEM) | A_DIM);
+      wattron(w_validators_in, COLOR_PAIR(CP_VALIDATOR) | A_BOLD);
+      wprintw(w_validators_in, "V-%d: ", num);
+      wattroff(w_validators_in, COLOR_PAIR(CP_VALIDATOR) | A_BOLD);
+      wattron(w_validators_in, COLOR_PAIR(CP_VALIDATOR));
+      wprintw(w_validators_in, "%s\n", status);
+      wattroff(w_validators_in, COLOR_PAIR(CP_VALIDATOR));
+
+      touchwin(w_validators);
+      wnoutrefresh(w_validators);    // Refresh the border
+      wnoutrefresh(w_validators_in); // Refresh the content
+      doupdate();
     }
+  } else if (strcmp(type, "UPDATER") == 0 && idx >= 0 && idx < 2) {
+    if (w_updaters_in) {
+      wattron(w_updaters_in, COLOR_PAIR(CP_SYSTEM) | A_DIM);
+      wprintw(w_updaters_in, "[%s] ", ts);
+      wattroff(w_updaters_in, COLOR_PAIR(CP_SYSTEM) | A_DIM);
+      wattron(w_updaters_in, COLOR_PAIR(CP_UPDATER) | A_BOLD);
+      wprintw(w_updaters_in, "U-%d: ", num);
+      wattroff(w_updaters_in, COLOR_PAIR(CP_UPDATER) | A_BOLD);
+      wattron(w_updaters_in, COLOR_PAIR(CP_UPDATER));
+      wprintw(w_updaters_in, "%s\n", status);
+      wattroff(w_updaters_in, COLOR_PAIR(CP_UPDATER));
 
-    char type_line[48];
-    snprintf(type_line, sizeof(type_line), "Transaction:    %s", txn_type);
-    box_row_center(type_line, ANSI_BR_YELLOW, bc);
-
-    char bal_line[48];
-    snprintf(bal_line, sizeof(bal_line),
-             "Current Balance: $%.2f", current_balance);
-    box_row_center(bal_line, ANSI_BR_GREEN, bc);
-
-    box_blank(bc);
-    box_divider(bc);
-
-    if (strcmp(txn_type, "WITHDRAWAL") == 0 ||
-        strcmp(txn_type, "TRANSFER")   == 0) {
-        char limit_line[64];
-        snprintf(limit_line, sizeof(limit_line),
-                 "Maximum you can enter: $%.2f", current_balance);
-        box_row_center(limit_line, ANSI_BR_YELLOW, bc);
-        box_blank(bc);
+      touchwin(w_updaters);
+      wnoutrefresh(w_updaters);    // Refresh the border
+      wnoutrefresh(w_updaters_in); // Refresh the content
+      doupdate();
     }
-
-    {
-        const char* hint = "  Type the amount (e.g. 250) and press Enter:";
-        int vis = (int)strlen(hint);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET,
-               ANSI_DIM, ANSI_WHITE, hint,
-               std::string(pad, ' ').c_str(),
-               ANSI_RESET, ANSI_BOLD, bc, BOX_V, ANSI_RESET);
-    }
-    box_bottom(bc);
-    printf("\n");
-    fflush(stdout);
+  }
 }
 
-// ============================================================
-//  WIZARD — No Session Warning
-// ============================================================
-void ui_wizard_warn_no_session(const char* user_name) {
-    const char* bc = ANSI_BR_YELLOW;
-    printf("\n");
-    box_top_titled(" WARNING — This account is logged out ", bc);
-    box_blank(bc);
-
-    char line[64];
-    snprintf(line, sizeof(line),
-             "%s is currently NOT logged in.", user_name);
-    box_row_center(line, ANSI_BR_YELLOW, bc);
-    box_row_center("This transaction will be REJECTED",  ANSI_BR_RED,    bc);
-    box_row_center("by the validation system.",           ANSI_BR_RED,    bc);
-    box_blank(bc);
-    box_row_center("Do you still want to continue? [y/n]:", ANSI_BR_WHITE, bc);
-    box_blank(bc);
-    box_bottom(bc);
-    printf("\n");
-    fflush(stdout);
+// ── Queue push ────────────────────────────────────────────────
+void ui_queue_push(int txn_id, const char *user_name, const char *type,
+                   double amount) {
+  std::lock_guard<std::mutex> lk(g_ui_mutex);
+  QEntry &e = g_qbuf[g_qcount % 32];
+  e.id = txn_id;
+  snprintf(e.user, sizeof(e.user), "%s", user_name);
+  snprintf(e.type, sizeof(e.type), "%s", type);
+  e.amount = amount;
+  g_qcount++;
+  g_current_buf_count++; // Increment live count
+  if (g_current_buf_count > 8)
+    g_current_buf_count = 8;
+  redraw_queue();
 }
 
-// ============================================================
-//  WIZARD — Confirm Transaction
-// ============================================================
-void ui_wizard_show_confirm(int user_id,    const char* user_name,
-                             const char* txn_type, double amount,
-                             int recipient_id, const char* recipient_name) {
-    const char* bc = ANSI_BR_WHITE;
-    printf("\n");
-    box_top_titled(" REVIEW YOUR TRANSACTION ", bc);
-    box_blank(bc);
+void ui_queue_pop() {
+  std::lock_guard<std::mutex> lk(g_ui_mutex);
+  if (g_current_buf_count > 0)
+    g_current_buf_count--;
+  redraw_queue();
+}
 
-    char uid_line[32];
-    snprintf(uid_line, sizeof(uid_line), "[%d] %s", user_id, user_name);
-    box_row_lv("  Account Holder  ", uid_line,    ANSI_DIM, ANSI_BR_CYAN,   bc);
-    box_row_lv("  Transaction     ", txn_type,    ANSI_DIM, ANSI_BR_YELLOW, bc);
+// ── Event log ─────────────────────────────────────────────────
+void ui_add_log(const char *thread_type, int thread_num, const char *message,
+                const char *timestamp) {
+  std::lock_guard<std::mutex> lk(g_ui_mutex);
+  if (!w_events_in)
+    return;
 
-    // Show recipient for transfers
-    if (recipient_id > 0 && recipient_name != nullptr) {
-        char rec_line[32];
-        snprintf(rec_line, sizeof(rec_line), "[%d] %s",
-                 recipient_id, recipient_name);
-        box_row_lv("  Sending To      ", rec_line, ANSI_DIM, ANSI_BR_BLUE, bc);
+  int cp = CP_SYSTEM;
+  if (strcmp(thread_type, "PRODUCER") == 0)
+    cp = CP_PRODUCER;
+  else if (strcmp(thread_type, "VALIDATOR") == 0)
+    cp = CP_VALIDATOR;
+  else if (strcmp(thread_type, "UPDATER") == 0)
+    cp = CP_UPDATER;
+  else if (strcmp(thread_type, "MONITOR") == 0)
+    cp = CP_MONITOR;
+
+  // Label
+  wattron(w_events_in, COLOR_PAIR(cp) | A_BOLD);
+  if (thread_num > 0)
+    wprintw(w_events_in, "%s-%d: ", thread_type, thread_num);
+  else
+    wprintw(w_events_in, "%s: ", thread_type);
+  wattroff(w_events_in, COLOR_PAIR(cp) | A_BOLD);
+
+  // Message handling: split by newline to avoid wrapping mess
+  std::string msg(message);
+  size_t pos = 0;
+  while ((pos = msg.find('\n')) != std::string::npos) {
+    std::string line = msg.substr(0, pos);
+    size_t first = line.find_first_not_of(' ');
+    if (std::string::npos != first)
+      line = line.substr(first);
+
+    if (!line.empty()) {
+      wattron(w_events_in, COLOR_PAIR(CP_SYSTEM) | A_DIM);
+      wprintw(w_events_in, " > ");
+      wattroff(w_events_in, COLOR_PAIR(CP_SYSTEM) | A_DIM);
+      wprintw(w_events_in, "%s\n", line.c_str());
     }
+    msg.erase(0, pos + 1);
+  }
 
-    char amt_line[32];
-    snprintf(amt_line, sizeof(amt_line), "$%.2f", amount);
-    box_row_lv("  Amount          ", amt_line,    ANSI_DIM, ANSI_BR_GREEN,  bc);
+  if (!msg.empty()) {
+    int mcp = CP_SYSTEM;
+    if (msg.find("REJECTED") != std::string::npos ||
+        msg.find("FAIL") != std::string::npos)
+      mcp = CP_ERROR;
+    else if (msg.find("SAVED") != std::string::npos ||
+             msg.find("DONE") != std::string::npos ||
+             msg.find("ACCEPTED") != std::string::npos)
+      mcp = CP_SUCCESS;
 
-    box_blank(bc);
-    box_divider(bc);
-    box_row_center("Press Enter to CONFIRM  or  type 'c' to CANCEL",
-                   ANSI_BR_WHITE, bc);
-    box_blank(bc);
-    box_bottom(bc);
-    printf("\n");
-    fflush(stdout);
+    wattron(w_events_in, COLOR_PAIR(mcp));
+    wprintw(w_events_in, "%s\n", msg.c_str());
+    wattroff(w_events_in, COLOR_PAIR(mcp));
+  }
+
+  touchwin(w_events);
+  wnoutrefresh(w_events);    // Refresh the border
+  wnoutrefresh(w_events_in); // Refresh the content
+  doupdate();
 }
 
-// ============================================================
-//  WIZARD — Transaction Queued (Success)
-// ============================================================
-void ui_wizard_show_queued(int txn_id, int user_id,
-                            const char* user_name,
-                            const char* txn_type, double amount,
-                            int recipient_id, const char* recipient_name) {
-    const char* bc = ANSI_BR_GREEN;
-    printf("\n");
-    box_top_titled(" TRANSACTION ACCEPTED ", bc);
-    box_blank(bc);
+// ── Metrics ───────────────────────────────────────────────────
+void ui_update_monitor(int snapshot_num, int buf_count, int buf_total,
+                       int /*done*/, int rejected, int pending, int processing,
+                       int committed, double tps, int deposits, int withdrawals,
+                       int transfers) {
+  std::lock_guard<std::mutex> lk(g_ui_mutex);
+  // Don't override g_current_buf_count here to keep the live pushes/pops
+  if (!w_metrics)
+    return;
+  werase(w_metrics);
+  titled_box(w_metrics, "SYSTEM METRICS", CP_MONITOR);
 
-    char id_line[32];
-    snprintf(id_line, sizeof(id_line), "Transaction #%d", txn_id);
-    box_row_center(id_line, ANSI_BR_CYAN, bc);
-    box_blank(bc);
+  redraw_queue(); // Update the queue bar whenever metrics are updated
 
-    char uid_line[32];
-    snprintf(uid_line, sizeof(uid_line), "[%d] %s", user_id, user_name);
-    box_row_lv("  From Account    ", uid_line,  ANSI_DIM, ANSI_BR_WHITE,  bc);
+  wattron(w_metrics, COLOR_PAIR(CP_SUCCESS) | A_BOLD);
+  mvwprintw(w_metrics, 1, 2, "TPS         : %.2f", tps);
+  wattroff(w_metrics, COLOR_PAIR(CP_SUCCESS) | A_BOLD);
 
-    if (recipient_id > 0 && recipient_name != nullptr) {
-        char rec_line[32];
-        snprintf(rec_line, sizeof(rec_line), "[%d] %s",
-                 recipient_id, recipient_name);
-        box_row_lv("  To Account      ", rec_line, ANSI_DIM, ANSI_BR_BLUE, bc);
-    }
+  wattron(w_metrics, COLOR_PAIR(CP_SYSTEM));
+  mvwprintw(w_metrics, 2, 2, "Committed   : %d", committed);
+  mvwprintw(w_metrics, 3, 2, "Rejected    : %d", rejected);
+  mvwprintw(w_metrics, 4, 2, "Pending     : %d", pending);
+  mvwprintw(w_metrics, 5, 2, "Processing  : %d", processing);
+  wattroff(w_metrics, COLOR_PAIR(CP_SYSTEM));
 
-    box_row_lv("  Type            ", txn_type,  ANSI_DIM, ANSI_BR_YELLOW, bc);
+  wattron(w_metrics, COLOR_PAIR(CP_PRODUCER));
+  mvwprintw(w_metrics, 2, getmaxx(w_metrics) / 2, "Deposits    : %d", deposits);
+  wattroff(w_metrics, COLOR_PAIR(CP_PRODUCER));
+  wattron(w_metrics, COLOR_PAIR(CP_VALIDATOR));
+  mvwprintw(w_metrics, 3, getmaxx(w_metrics) / 2, "Withdrawals : %d",
+            withdrawals);
+  wattroff(w_metrics, COLOR_PAIR(CP_VALIDATOR));
+  wattron(w_metrics, COLOR_PAIR(CP_UPDATER));
+  mvwprintw(w_metrics, 4, getmaxx(w_metrics) / 2, "Transfers   : %d",
+            transfers);
+  wattroff(w_metrics, COLOR_PAIR(CP_UPDATER));
 
-    char amt_line[32];
-    snprintf(amt_line, sizeof(amt_line), "$%.2f", amount);
-    box_row_lv("  Amount          ", amt_line,  ANSI_DIM, ANSI_BR_GREEN,  bc);
+  wattron(w_metrics, COLOR_PAIR(CP_SYSTEM) | A_DIM);
+  mvwprintw(w_metrics, 6, 2, "Snapshot #%d", snapshot_num);
+  wattroff(w_metrics, COLOR_PAIR(CP_SYSTEM) | A_DIM);
 
-    box_blank(bc);
-    box_divider(bc);
-    box_row_center("Your transaction is now being processed by the system.",
-                   ANSI_BR_GREEN, bc);
-    box_row_center("Watch the log below to track its progress.",
-                   ANSI_DIM, bc);
-    box_blank(bc);
-    box_bottom(bc);
-    printf("\n");
-    fflush(stdout);
+  wrefresh(w_metrics);
+
+  // Also refresh header clock
+  time_t now = time(nullptr);
+  char ts[16];
+  strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
+  mvwprintw(w_header, 0, S_COLS - 10, "%s", ts);
+  wrefresh(w_header);
 }
 
-// ============================================================
-//  WIZARD — Cancelled
-// ============================================================
-void ui_wizard_show_cancelled() {
-    printf("\n  %s%s  Transaction cancelled. No changes were made.%s\n\n",
-           ANSI_BOLD, ANSI_BR_BLACK, ANSI_RESET);
-    fflush(stdout);
+// ── History ───────────────────────────────────────────────────
+void ui_history_push(int txn_id, const char *type, double amount, bool saved) {
+  std::lock_guard<std::mutex> lk(g_ui_mutex);
+  if (!w_history_in)
+    return;
+
+  HEntry e;
+  e.id = txn_id;
+  snprintf(e.type, sizeof(e.type), "%s", type);
+  snprintf(e.status, sizeof(e.status), "%s", saved ? "SAVED" : "FAILED");
+  e.amount = amount;
+  time_t now = time(nullptr);
+  strftime(e.ts, sizeof(e.ts), "%H:%M:%S", localtime(&now));
+  g_hist.push_back(e);
+
+  int cp = saved ? CP_SUCCESS : CP_ERROR;
+  wattron(w_history_in, COLOR_PAIR(cp));
+  wprintw(w_history_in, "  %-6d %-12s %10.2f\n", e.id, e.type, e.amount);
+  wattroff(w_history_in, COLOR_PAIR(cp));
+
+  touchwin(w_history);
+  wnoutrefresh(w_history);    // Refresh the border
+  wnoutrefresh(w_history_in); // Refresh the content
+  doupdate();
 }
 
-// ============================================================
-//  WIZARD — Step Prompt
-// ============================================================
-void ui_wizard_prompt(const char* step_label) {
-    printf("  %s%s%s  %s",
-           ANSI_BOLD, ANSI_BR_CYAN, step_label, ANSI_RESET);
-    fflush(stdout);
+// ── Wizard ────────────────────────────────────────────────────
+static void ensure_wizard() {
+  if (!w_wizard)
+    w_wizard = newwin(TOP_H, S_COLS / 2, HEADER_H, S_COLS / 4);
 }
 
-// ============================================================
-//  WIZARD — Error Message
-// ============================================================
-void ui_wizard_error(const char* msg) {
-    printf("\n  %s%s  ERROR  %s  %s%s\n\n",
-           ANSI_BOLD, ANSI_BG_RED,
-           ANSI_RESET, ANSI_BR_RED, msg, ANSI_RESET);
-    fflush(stdout);
+void ui_wizard_clear() {
+  std::lock_guard<std::mutex> lk(g_ui_mutex);
+  ensure_wizard();
+  werase(w_wizard);
+  titled_box(w_wizard, "MANUAL TRANSACTION WIZARD", CP_HEADER);
+  wrefresh(w_wizard);
 }
 
-// ============================================================
-//  WIZARD — Ask Another Transaction
-//  FIX: no prompt printed here — prompt is in wizard_read_line()
-// ============================================================
-void ui_wizard_ask_another() {
-    const char* bc = ANSI_BR_BLACK;
-    printf("\n");
-    box_top_titled(" What would you like to do next? ", bc);
-    box_blank(bc);
-    box_row_center("[1]  Make another transaction",  ANSI_BR_WHITE, bc);
-    box_blank(bc);
-    box_row_center("[q]  Exit manual input mode",    ANSI_BR_BLACK, bc);
-    box_blank(bc);
-    box_bottom(bc);
-    // NO printf/prompt here — wizard_read_line() handles the prompt
-    printf("\n");
-    fflush(stdout);
+void ui_wizard_print(int row, int col, const char *text, int color_pair) {
+  std::lock_guard<std::mutex> lk(g_ui_mutex);
+  ensure_wizard();
+  if (color_pair > 0)
+    wattron(w_wizard, COLOR_PAIR(color_pair) | A_BOLD);
+  mvwprintw(w_wizard, row + 1, col + 2, "%s", text);
+  if (color_pair > 0)
+    wattroff(w_wizard, COLOR_PAIR(color_pair) | A_BOLD);
+  wrefresh(w_wizard);
 }
 
-// ============================================================
-//  Legacy input functions
-// ============================================================
-void ui_print_input_panel() {}
-
-void ui_print_input_prompt() {
-    printf("  %s%s txn %s%s%s >  %s",
-           ANSI_BOLD, ANSI_BG_CYAN,
-           ANSI_RESET, ANSI_BOLD, UI_COLOR_PRODUCER, ANSI_RESET);
-    fflush(stdout);
+void ui_wizard_get_string(char *buf, int max_len, const char *prompt) {
+  {
+    std::lock_guard<std::mutex> lk(g_ui_mutex);
+    ensure_wizard();
+    wattron(w_wizard, COLOR_PAIR(CP_SUCCESS));
+    mvwprintw(w_wizard, 3, 2, "%-36s", prompt);
+    mvwprintw(w_wizard, 4, 2, "> ");
+    wattroff(w_wizard, COLOR_PAIR(CP_SUCCESS));
+    wrefresh(w_wizard);
+    curs_set(1);
+    echo();
+  }
+  wgetnstr(w_wizard, buf, max_len - 1);
+  {
+    std::lock_guard<std::mutex> lk(g_ui_mutex);
+    noecho();
+    curs_set(0);
+    wrefresh(w_wizard);
+  }
 }
 
-void ui_print_input_error(const char* field, const char* reason) {
-    printf("\n  %s%s ERROR %s  %s%s: %s%s\n\n",
-           ANSI_BOLD, ANSI_BG_RED, ANSI_RESET,
-           ANSI_BR_RED, ANSI_BOLD, field,
-           ANSI_RESET, ANSI_BR_WHITE, reason, ANSI_RESET);
-    fflush(stdout);
-}
-
-void ui_print_input_success(int txn_id, int user_id,
-                             double amount, const char* type) {
-    printf("\n  %s%s ACCEPTED %s  Transaction #%d  User:%d  $%.0f  %s%s\n\n",
-           ANSI_BOLD, ANSI_BG_GREEN, ANSI_RESET,
-           txn_id, user_id, amount, type, ANSI_RESET);
-    fflush(stdout);
-}
-
-void ui_print_input_hint(const char* hint) {
-    printf("  %s%s  Note: %s%s\n",
-           ANSI_BOLD, ANSI_BR_YELLOW, hint, ANSI_RESET);
-    fflush(stdout);
-}
-
-// ============================================================
-//  ui_animate_transition()
-// ============================================================
-void ui_animate_transition(const char* from_stage,
-                           const char* to_stage,
-                           const char* detail) {
-    const char* frames[] = {".", "-", "-", ">"};
-    for (int i = 0; i < 4; i++) {
-        printf("\r  %s%s%-14s%s  %s%s%s  %s%-14s%s  %s%s%s",
-               ANSI_BOLD, UI_COLOR_PRODUCER, from_stage, ANSI_RESET,
-               ANSI_BR_BLACK, frames[i], ANSI_RESET,
-               ANSI_BOLD, UI_COLOR_VALIDATOR, to_stage, ANSI_RESET,
-               ANSI_DIM, ANSI_WHITE, detail, ANSI_RESET);
-        fflush(stdout);
-        usleep(80000);
-    }
-    printf("\n");
-    fflush(stdout);
-}
-
-// ============================================================
-//  ui_format_log()
-//  IMPROVED: human-readable messages shown here
-// ============================================================
-std::string ui_format_log(const char* thread_type,
-                           int         thread_num,
-                           const char* message,
-                           const char* timestamp) {
-    const char* color  = ANSI_BR_WHITE;
-    const char* symbol = "*";
-
-    if      (strcmp(thread_type, "PRODUCER")  == 0) {
-        color = UI_COLOR_PRODUCER;  symbol = ">";
-    }
-    else if (strcmp(thread_type, "VALIDATOR") == 0) {
-        color = UI_COLOR_VALIDATOR; symbol = "#";
-    }
-    else if (strcmp(thread_type, "UPDATER")   == 0) {
-        color = UI_COLOR_UPDATER;   symbol = "+";
-    }
-    else if (strcmp(thread_type, "MONITOR")   == 0) {
-        color = UI_COLOR_MONITOR;   symbol = "o";
-    }
-    else {
-        color = UI_COLOR_SYSTEM;    symbol = ".";
-    }
-
-    char label[24];
-    if (thread_num > 0)
-        snprintf(label, sizeof(label), "%s-%d", thread_type, thread_num);
-    else
-        snprintf(label, sizeof(label), "%s", thread_type);
-
-    std::string msg_str(message);
-    const char* mc = ANSI_WHITE;
-    if      (msg_str.find("REJECTED")  != std::string::npos) mc = ANSI_BR_RED;
-    else if (msg_str.find("ACCEPTED")  != std::string::npos ||
-             msg_str.find("VALID")     != std::string::npos ||
-             msg_str.find("COMMITTED") != std::string::npos ||
-             msg_str.find("SAVED")     != std::string::npos) mc = ANSI_BR_GREEN;
-    else if (msg_str.find("WARNING")   != std::string::npos ||
-             msg_str.find("FAILED")    != std::string::npos) mc = ANSI_BR_YELLOW;
-
-    char buf[1024];
-    snprintf(buf, sizeof(buf),
-        "%s%s[%s]%s %s%s%s%s %s%-14s%s %s%s%s",
-        ANSI_DIM, ANSI_WHITE, timestamp, ANSI_RESET,
-        ANSI_BOLD, color, symbol, ANSI_RESET,
-        ANSI_BOLD, color, label, ANSI_RESET,
-        mc, message, ANSI_RESET);
-
-    return std::string(buf);
-}
-
-// ============================================================
-//  ui_print_section()
-// ============================================================
-void ui_print_section(const char* title) {
-    int t_len = (int)strlen(title);
-    int side  = (W - t_len - 4) / 2;
-    if (side < 0) side = 0;
-    printf("\n%s%s%s %s%s%s%s %s%s%s\n\n",
-           ANSI_BOLD, ANSI_BR_BLACK,
-           ui_repeat("─", side).c_str(),
-           ANSI_RESET, ANSI_BOLD, ANSI_BR_WHITE, title,
-           ANSI_RESET, ANSI_BOLD, ANSI_BR_BLACK,
-           ui_repeat("─", side).c_str(), ANSI_RESET);
-    fflush(stdout);
-}
-
-// ============================================================
-//  ui_print_monitor_snapshot()
-//  FIX: WARNING only shown when pending+processing > 0
-//       AND system is still running (not just pre-commit lag)
-// ============================================================
-void ui_print_monitor_snapshot(int snapshot_num,
-                                int buf_count, int buf_total,
-                                int done,      int rejected,
-                                int pending,   int processing,
-                                int committed, double tps,
-                                int deposits,  int withdrawals, int transfers) {
-    (void)done;
-    (void)rejected;
-    const char* bc    = ANSI_BR_MAGENTA;
-    int inner = W - 2;
-
-    printf("\n");
-
-    // Titled top border
-    char title[32];
-    snprintf(title, sizeof(title), " System Update #%d ", snapshot_num);
-    int t_vis = (int)strlen(title);
-    int left  = (inner - t_vis) / 2;
-    int right = inner - t_vis - left;
-    if (left  < 0) left  = 0;
-    if (right < 0) right = 0;
-
-    printf("%s%s%s%s%s%s%s%s%s%s%s\n",
-           ANSI_BOLD, bc,
-           THIN_TL, ui_repeat(THIN_H, left).c_str(),
-           ANSI_RESET, ANSI_BOLD, UI_COLOR_MONITOR, title,
-           ANSI_RESET, ANSI_BOLD, bc,
-           ui_repeat(THIN_H, right).c_str(), THIN_TR, ANSI_RESET);
-
-    // Buffer bar
-    {
-        std::string bar_vis = "[", bar_col = "[";
-        for (int i = 0; i < buf_total; i++) {
-            if (i < buf_count) {
-                bar_col += std::string(ANSI_BR_CYAN) + "#" + ANSI_RESET;
-                bar_vis += "#";
-            } else {
-                bar_col += std::string(ANSI_BR_BLACK) + "." + ANSI_RESET;
-                bar_vis += ".";
-            }
-        }
-        bar_col += "]"; bar_vis += "]";
-        char suffix[32];
-        snprintf(suffix, sizeof(suffix), "  %d/%d slots used",
-                 buf_count, buf_total);
-        int vis = 2 + 20 + (int)bar_vis.size() + (int)strlen(suffix);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %sTransaction Queue  %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, THIN_V, ANSI_RESET,
-               bar_col.c_str(),
-               ANSI_WHITE, suffix, ANSI_RESET,
-               std::string(pad, ' ').c_str(),
-               ANSI_BOLD, bc, THIN_V, ANSI_RESET);
-    }
-
-    // Divider
-    printf("%s%s%s%s%s%s\n",
-           ANSI_BOLD, bc,
-           THIN_ML, ui_repeat(THIN_H, inner).c_str(), THIN_MR, ANSI_RESET);
-
-    // Live economy balances
-    {
-        double b1 = std::max(0.0, db_get_balance_global(1));
-        double b2 = std::max(0.0, db_get_balance_global(2));
-        double b3 = std::max(0.0, db_get_balance_global(3));
-        double b4 = std::max(0.0, db_get_balance_global(4));
-        char bal_str[128];
-        snprintf(bal_str, sizeof(bal_str), 
-            "A:$%-5.0f B:$%-5.0f C:$%-5.0f D:$%-5.0f", b1, b2, b3, b4);
-        std::string bal_vis = bal_str;
-        int lpad = (inner - bal_vis.length()) / 2;
-        int rpad = inner - bal_vis.length() - lpad;
-        if (lpad < 0) lpad = 0; 
-        if (rpad < 0) rpad = 0;
-        printf("%s%s%s%s%s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, THIN_V, ANSI_RESET,
-               std::string(lpad, ' ').c_str(),
-               ANSI_BR_GREEN, bal_str, ANSI_RESET,
-               std::string(rpad, ' ').c_str(),
-               ANSI_BOLD, bc, THIN_V, ANSI_RESET);
-    }
-
-    // Divider
-    printf("%s%s%s%s%s%s\n",
-           ANSI_BOLD, bc,
-           THIN_ML, ui_repeat(THIN_H, inner).c_str(), THIN_MR, ANSI_RESET);
-
-    // Traffic Summary
-    {
-        char traffic[128];
-        snprintf(traffic, sizeof(traffic),
-                 "Deposits:%-3d Withdrawals:%-3d Transfers:%-3d",
-                 deposits, withdrawals, transfers);
-        std::string t_vis = traffic;
-        int lpad = (inner - t_vis.length()) / 2;
-        int rpad = inner - t_vis.length() - lpad;
-        if (lpad < 0) lpad = 0;
-        if (rpad < 0) rpad = 0;
-        printf("%s%s%s%s%s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, THIN_V, ANSI_RESET,
-               std::string(lpad, ' ').c_str(),
-               ANSI_BOLD ANSI_WHITE, traffic, ANSI_RESET,
-               std::string(rpad, ' ').c_str(),
-               ANSI_BOLD, bc, THIN_V, ANSI_RESET);
-    }
-
-    // Pipeline Visualizer
-    {
-        char pipe1[128];
-        snprintf(pipe1, sizeof(pipe1), 
-                 "[PRODUCER] ──(%d)──> [VALIDATOR] ──(%d)──> [UPDATER]",
-                 buf_count, processing);
-        
-        char pipe2[128];
-        snprintf(pipe2, sizeof(pipe2), 
-                 "             queue                 pipe       => %d SAVED",
-                 committed);
-
-        auto draw_pipe = [&](const char* str, const char* col) {
-            std::string s = str;
-            int lpad = (inner - s.length()) / 2;
-            int rpad = inner - s.length() - lpad;
-            if (lpad < 0) lpad = 0; 
-            if (rpad < 0) rpad = 0;
-            printf("%s%s%s%s%s%s%s%s%s%s\n",
-                   ANSI_BOLD, bc, THIN_V, ANSI_RESET,
-                   std::string(lpad, ' ').c_str(),
-                   col, str, ANSI_RESET,
-                   std::string(rpad, ' ').c_str(),
-                   ANSI_BOLD, bc, THIN_V, ANSI_RESET);
-        };
-        draw_pipe(pipe1, ANSI_BR_WHITE);
-        draw_pipe(pipe2, ANSI_BR_YELLOW);
-    }
-
-    // Divider
-    printf("%s%s%s%s%s%s\n",
-           ANSI_BOLD, bc,
-           THIN_ML, ui_repeat(THIN_H, inner).c_str(), THIN_MR, ANSI_RESET);
-
-    // Throughput
-    {
-        char tps_str[16];
-        snprintf(tps_str, sizeof(tps_str), "%.1f per second", tps);
-        int vis = (int)strlen("Pipeline speed               ")
-                + (int)strlen(tps_str);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %sPipeline speed               %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, THIN_V, ANSI_RESET,
-               ANSI_WHITE,
-               std::string(pad, ' ').c_str(),
-               ANSI_BOLD, ANSI_BR_CYAN, tps_str, ANSI_RESET,
-               ANSI_BOLD, bc, THIN_V, ANSI_RESET);
-    }
-
-    // WARNING only when truly stuck (more than 3 pending AND no progress)
-    // Avoids false alarm when a transaction was just submitted
-    if ((pending + processing) > 3) {
-        char warn[80];
-        snprintf(warn, sizeof(warn),
-                 "Note: %d transactions are waiting longer than expected",
-                 pending + processing);
-        int vis = (int)strlen(warn);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, THIN_V, ANSI_RESET,
-               ANSI_BOLD, ANSI_BR_YELLOW, warn, ANSI_RESET,
-               std::string(pad, ' ').c_str(),
-               ANSI_BOLD, bc, THIN_V, ANSI_RESET);
-    }
-
-    printf("%s%s%s%s%s%s\n\n",
-           ANSI_BOLD, bc,
-           THIN_BL, ui_repeat(THIN_H, inner).c_str(), THIN_BR, ANSI_RESET);
-    fflush(stdout);
-}
-
-// ============================================================
-//  ui_print_final_report()
-// ============================================================
-void ui_print_final_report(int generated, int done, int rejected,
-                           int pending,   int processing, int committed) {
-    const char* bc   = ANSI_BR_WHITE;
-    bool audit_ok    = (generated == (done + rejected + pending + processing));
-    bool pipeline_ok = (done == committed);
-
-    printf("\n");
-    box_top_titled(" FINAL SYSTEM REPORT ", bc);
-
-    auto row = [&](const char* label, int val, const char* vc) {
-        char num[16]; snprintf(num, sizeof(num), "%d", val);
-        int vis = (int)strlen(label) + (int)strlen(num);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET,
-               ANSI_WHITE, label,
-               std::string(pad, ' ').c_str(),
-               ANSI_BOLD, vc, num, ANSI_RESET,
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET);
-    };
-
-    box_blank(bc);
-    row("Total transactions created     ", generated,  ANSI_BR_CYAN);
-    box_blank(bc);
-    box_divider(bc);
-    box_blank(bc);
-    row("Successfully validated         ", done,       ANSI_BR_GREEN);
-    row("Rejected by validation system  ", rejected,   ANSI_BR_RED);
-    row("Still waiting (should be 0)    ", pending,
-        pending > 0 ? ANSI_BR_YELLOW : ANSI_BR_BLACK);
-    row("Still processing (should be 0) ", processing,
-        processing > 0 ? ANSI_BR_YELLOW : ANSI_BR_BLACK);
-    box_blank(bc);
-    row("Permanently saved to database  ", committed,  ANSI_BR_GREEN);
-    box_blank(bc);
-    box_divider(bc);
-    box_blank(bc);
-
-    auto check_row = [&](const char* label, bool ok) {
-        const char* vc   = ok ? ANSI_BR_GREEN : ANSI_BR_RED;
-        const char* word = ok ? "PASS" : "FAIL";
-        const char* sym  = ok ? CHECK  : CROSS;
-        int vis = 3 + (int)strlen(label) + 4;
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET,
-               ANSI_BOLD, vc, sym, ANSI_RESET,
-               ANSI_WHITE, label,
-               std::string(pad, ' ').c_str(),
-               ANSI_BOLD, vc, word, ANSI_RESET,
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET);
-    };
-
-    check_row("All transactions accounted for ", audit_ok);
-    check_row("All validated = all saved      ", pipeline_ok);
-    box_blank(bc);
-    box_divider(bc);
-
-    auto hint_row = [&](const char* h) {
-        int vis = (int)strlen(h);
-        int pad = (W - 4) - vis; if (pad < 0) pad = 0;
-        printf("%s%s%s  %s%s%s%s%s%s\n",
-               ANSI_BOLD, bc, BOX_V, ANSI_RESET,
-               ANSI_DIM, ANSI_WHITE, h,
-               std::string(pad, ' ').c_str(),
-               ANSI_RESET, ANSI_BOLD, bc, BOX_V, ANSI_RESET);
-    };
-
-    hint_row("  To inspect results: sqlite3 transactions.db");
-    hint_row("  SELECT * FROM transactions;");
-    hint_row("  SELECT user_id, name, balance FROM users;");
-    box_blank(bc);
-    box_bottom(bc);
-    printf("\n");
-    fflush(stdout);
-}
-
-// ============================================================
-//  ui_print_shutdown_banner()
-// ============================================================
-void ui_print_shutdown_banner() {
-    printf("\n%s%s  System is shutting down — finishing all pending work...%s\n\n",
-           ANSI_BOLD, ANSI_BR_YELLOW, ANSI_RESET);
-    fflush(stdout);
+// ── Final report ─────────────────────────────────────────────
+void ui_show_final_report(int generated, int done, int rejected, int pending,
+                          int processing, int committed) {
+  printf("\n============================================================\n");
+  printf("  FINAL REPORT\n");
+  printf("============================================================\n");
+  printf("  Generated  : %d\n", generated);
+  printf("  Committed  : %d\n", committed);
+  printf("  Done       : %d\n", done);
+  printf("  Rejected   : %d\n", rejected);
+  printf("  Pending    : %d\n", pending);
+  printf("  Processing : %d\n", processing);
+  printf("============================================================\n\n");
 }

@@ -1,22 +1,9 @@
-// ============================================================
-//  producer.cpp
-//  FIXES:
-//    1. "Your choice:" prompt: g_input_active set BEFORE the
-//       "Another transaction?" panel draws — prevents any log
-//       message from appearing between the panel and prompt
-//    2. Auto TRANSFER picks a random different user as recipient
-//       and stores them in txn.recipient_id / txn.recipient_name
-//    3. Arrow-key escape sequences stripped from input
-//    4. Human-readable log messages throughout
-// ============================================================
-
 #include "producer.h"
 #include "transaction.h"
 #include "shared_buffer.h"
 #include "database.h"
 #include "logger.h"
 #include "ui.h"
-#include "monitor.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -28,6 +15,9 @@
 
 extern std::atomic<bool> g_running;
 extern std::atomic<int>  g_next_txn_id;
+extern std::atomic<bool> g_input_active;
+
+static const int AUTO_TRANSITION_DELAY_US = 100000; // 100ms delay for simulation
 
 static const struct {
     int         id;
@@ -50,62 +40,12 @@ static constexpr const char* get_user_name(int uid) {
     return "Unknown";
 }
 
-// ── Strip ANSI escape sequences and whitespace from input ────
-static void strip_input(char* buf) {
-    char clean[256]; int j = 0;
-    for (int i = 0; buf[i]; i++) {
-        if ((unsigned char)buf[i] == 0x1B) {
-            i++;  // skip '['
-            while (buf[i] && !((buf[i]>='A'&&buf[i]<='Z')||
-                                (buf[i]>='a'&&buf[i]<='z'))) i++;
-            continue;
-        }
-        clean[j++] = buf[i];
-    }
-    clean[j] = '\0';
-    memcpy(buf, clean, j+1);
-    int end = (int)strlen(buf)-1;
-    while (end>=0 && (buf[end]=='\n'||buf[end]=='\r'||buf[end]==' '))
-        buf[end--] = '\0';
-    int start = 0;
-    while (buf[start]==' ') start++;
-    if (start>0) memmove(buf, buf+start, strlen(buf)-start+1);
-}
-
 // ── wizard_read_line() ────────────────────────────────────────
-// Sets g_input_active=true BEFORE printing the prompt.
-// This must be called as the very first output after any panel.
-// The monitor will not print while this flag is true.
 static bool wizard_read_line(const char* prompt, char* buf, int buf_size) {
     g_input_active.store(true);
-    ui_wizard_prompt(prompt);
-
-    bool ok = false;
-    while (g_running.load()) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(STDIN_FILENO, &fds);
-        
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000; // 100ms timeout
-
-        int ret = select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv);
-        if (ret > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
-            if (fgets(buf, buf_size, stdin) != nullptr) {
-                ok = true;
-            }
-            break;
-        } else if (ret < 0) {
-            // Error or signal interrupt
-            break;
-        }
-    }
-
+    ui_wizard_get_string(buf, buf_size, prompt);
     g_input_active.store(false);
-    if (!ok) return false;
-    strip_input(buf);
-    if (!g_running.load() && strlen(buf)==0) return false;
+    if (strlen(buf) == 0) return false;
     return true;
 }
 
@@ -113,24 +53,10 @@ static bool is_quit(const char* s) {
     return strcmp(s,"quit")==0||strcmp(s,"exit")==0||strcmp(s,"q")==0;
 }
 
-// ── wait_for_logger() ─────────────────────────────────────────
-// Waits 150ms for the logger to flush any queued messages
-// BEFORE we draw a wizard panel. Prevents log lines from
-// appearing inside the panel or between panel and prompt.
-static void wait_for_logger() {
-    usleep(150000);  // 150ms — logger typically flushes in < 50ms
-}
-
-// ============================================================
-//  AUTOMATIC TRANSACTION HELPER
-//  For TRANSFER: picks a random different user as recipient
-//  and stores them in txn.recipient_id / txn.recipient_name
-// ============================================================
 static Transaction make_transaction(int thread_id) {
     Transaction txn;
     txn.transaction_id = g_next_txn_id.fetch_add(1);
 
-    // Pick sender
     int sender_idx = rand() % NUM_USERS;
     txn.user_id    = USERS[sender_idx].id;
 
@@ -140,11 +66,10 @@ static Transaction make_transaction(int thread_id) {
     txn.timestamp  = time(nullptr);
     txn.retry_count = 0;
 
-    // For TRANSFER: assign a random different recipient
     if (strcmp(txn.transaction_type, "TRANSFER") == 0) {
         int rec_idx;
         do { rec_idx = rand() % NUM_USERS; }
-        while (rec_idx == sender_idx);  // must be different from sender
+        while (rec_idx == sender_idx);
 
         txn.recipient_id = USERS[rec_idx].id;
         strncpy(txn.recipient_name, USERS[rec_idx].name, MAX_NAME_LEN-1);
@@ -159,7 +84,6 @@ static Transaction make_transaction(int thread_id) {
         + "  |  " + txn.transaction_type
         + "  |  $" + std::to_string((int)txn.amount);
 
-    // Show recipient for TRANSFER
     if (txn.recipient_id > 0)
         msg += "  |  To: " + std::string(txn.recipient_name);
 
@@ -167,9 +91,6 @@ static Transaction make_transaction(int thread_id) {
     return txn;
 }
 
-// ============================================================
-//  producer_thread() — Automatic mode
-// ============================================================
 void* producer_thread(void* args) {
     ProducerArgs* a         = static_cast<ProducerArgs*>(args);
     SharedMemoryBuffer* buf = a->buffer;
@@ -185,6 +106,7 @@ void* producer_thread(void* args) {
 
     logger_log(ThreadType::PRODUCER, id,
                std::string("Auto producer started  [") + sn + " mode]");
+    ui_set_thread_status("PRODUCER", id, (std::string(sn) + " \u2014 started").c_str());
 
     while (g_running.load()) {
         if (style == ProducerStyle::BURST) {
@@ -192,11 +114,12 @@ void* producer_thread(void* args) {
                 Transaction txn = make_transaction(id);
                 usleep(AUTO_TRANSITION_DELAY_US);
                 shm_buffer_produce(buf, txn);
+                char st[72]; snprintf(st, 72, "[%s] Queued #%d", sn, txn.transaction_id);
+                ui_set_thread_status("PRODUCER", id, st);
+                ui_queue_push(txn.transaction_id, get_user_name(txn.user_id), txn.transaction_type, txn.amount);
                 logger_log(ThreadType::PRODUCER, id,
                     "Transaction #" + std::to_string(txn.transaction_id)
-                    + " placed in queue  ["
-                    + std::to_string(shm_buffer_count(buf)) + "/"
-                    + std::to_string(SHARED_BUFFER_SIZE) + " slots used]");
+                    + " placed in queue");
                 usleep(delay);
             }
             usleep(2000000);
@@ -204,11 +127,12 @@ void* producer_thread(void* args) {
             Transaction txn = make_transaction(id);
             usleep(AUTO_TRANSITION_DELAY_US);
             shm_buffer_produce(buf, txn);
+            char st2[72]; snprintf(st2, 72, "[%s] Queued #%d", sn, txn.transaction_id);
+            ui_set_thread_status("PRODUCER", id, st2);
+            ui_queue_push(txn.transaction_id, get_user_name(txn.user_id), txn.transaction_type, txn.amount);
             logger_log(ThreadType::PRODUCER, id,
                 "Transaction #" + std::to_string(txn.transaction_id)
-                + " placed in queue  ["
-                + std::to_string(shm_buffer_count(buf)) + "/"
-                + std::to_string(SHARED_BUFFER_SIZE) + " slots used]");
+                + " placed in queue");
             usleep(delay);
         }
     }
@@ -217,223 +141,93 @@ void* producer_thread(void* args) {
     return nullptr;
 }
 
-// ============================================================
-//  manual_producer_thread() — Step-by-step wizard
-//
-//  KEY FIX for "Your choice:" issue:
-//    Before drawing the "Another transaction?" panel we call:
-//      g_input_active.store(true)   ← BEFORE the panel draws
-//      wait_for_logger()            ← flush any pending log lines
-//      draw the panel               ← no log lines can interrupt
-//      wizard_read_line()           ← reads input (flag already set)
-//    This guarantees the panel and prompt appear clean with
-//    no log lines injected between them.
-// ============================================================
 void* manual_producer_thread(void* args) {
     ProducerArgs* a         = static_cast<ProducerArgs*>(args);
     SharedMemoryBuffer* buf = a->buffer;
     int id                  = a->thread_id;
-    bool manual_only        = a->manual;  // true = --manual mode; false = combined
+    bool manual_only        = a->manual;
 
     logger_log(ThreadType::PRODUCER, id, "Manual input wizard is ready.");
 
     char line[128];
 
     while (g_running.load()) {
+        ui_wizard_clear();
+        ui_wizard_print(0, 0, "Select User (1-5):", CP_HEADER);
+        for(int i=0; i<5; i++) {
+            char user_line[64];
+            snprintf(user_line, sizeof(user_line), "[%d] %s", USERS[i].id, USERS[i].name);
+            ui_wizard_print(1, i*12, user_line, USERS[i].has_session ? CP_SUCCESS : CP_ERROR);
+        }
 
-        // ── STEP 1: Select user ───────────────────────────────
-        // Set flag BEFORE drawing panel so no log lines interrupt
-        g_input_active.store(true);
-        wait_for_logger();
-        ui_wizard_show_users();
-        // wizard_read_line keeps flag true until input received
-        if (!wizard_read_line("Your choice [1-5] or 'q' to quit: ",
-                               line, sizeof(line))) break;
-        if (is_quit(line)) { logger_log(ThreadType::PRODUCER,id,"User exited wizard."); break; }
+        if (!wizard_read_line("Your choice (q to quit): ", line, sizeof(line))) break;
+        if (is_quit(line)) break;
 
         int user_choice = atoi(line);
-        if (user_choice < 1 || user_choice > 5) {
-            ui_wizard_error("Please enter a number between 1 and 5.");
-            continue;
-        }
+        if (user_choice < 1 || user_choice > 5) continue;
 
-        int         user_id   = USERS[user_choice-1].id;
+        int user_id = USERS[user_choice-1].id;
         const char* user_name = USERS[user_choice-1].name;
-        bool        has_sess  = USERS[user_choice-1].has_session;
 
-        if (!has_sess) {
-            g_input_active.store(true);
-            wait_for_logger();
-            ui_wizard_warn_no_session(user_name);
-            if (!wizard_read_line("Continue anyway? [y/n]: ",
-                                   line, sizeof(line))) break;
-            if (line[0]!='y' && line[0]!='Y') {
-                ui_wizard_show_cancelled(); continue;
-            }
-        }
-
-        // ── STEP 2: Select type ───────────────────────────────
-        g_input_active.store(true);
-        wait_for_logger();
-        ui_wizard_show_types(user_id, user_name);
-        if (!wizard_read_line("Your choice [1-3] or 'q' to quit: ",
-                               line, sizeof(line))) break;
-        if (is_quit(line)) { logger_log(ThreadType::PRODUCER,id,"User exited wizard."); break; }
+        ui_wizard_clear();
+        ui_wizard_print(0, 0, "Select Type:", CP_HEADER);
+        ui_wizard_print(1, 0, "[1] DEPOSIT  [2] WITHDRAWAL  [3] TRANSFER", CP_PRODUCER);
+        if (!wizard_read_line("Type [1-3]: ", line, sizeof(line))) break;
+        if (is_quit(line)) break;
 
         int type_choice = atoi(line);
-        if (type_choice < 1 || type_choice > 3) {
-            ui_wizard_error("Please enter 1, 2, or 3.");
-            continue;
-        }
+        if (type_choice < 1 || type_choice > 3) continue;
         const char* txn_type = TXN_TYPES[type_choice-1];
 
-        // ── STEP 2b: Select recipient (TRANSFER only) ─────────
-        int         recipient_id   = 0;
+        int recipient_id = 0;
         const char* recipient_name = nullptr;
 
-        if (strcmp(txn_type, "TRANSFER") == 0) {
-            g_input_active.store(true);
-            wait_for_logger();
-            ui_wizard_show_transfer_recipient(user_id, user_name);
-            if (!wizard_read_line("Recipient number or 'q' to quit: ",
-                                   line, sizeof(line))) break;
-            if (is_quit(line)) { logger_log(ThreadType::PRODUCER,id,"User exited wizard."); break; }
-
+        if (type_choice == 3) {
+            ui_wizard_clear();
+            ui_wizard_print(0, 0, "Select Recipient (1-5):", CP_HEADER);
+            if (!wizard_read_line("Recipient ID: ", line, sizeof(line))) break;
             int rec = atoi(line);
-            if (rec < 1 || rec > 5) {
-                ui_wizard_error("Please enter a number between 1 and 5.");
-                continue;
-            }
-            if (rec == user_choice) {
-                ui_wizard_error("You cannot transfer money to yourself.");
-                continue;
-            }
-            recipient_id   = USERS[rec-1].id;
+            if (rec < 1 || rec > 5 || rec == user_choice) continue;
+            recipient_id = USERS[rec-1].id;
             recipient_name = USERS[rec-1].name;
         }
 
-        // ── STEP 3: Enter amount ──────────────────────────────
-        double balance = db_get_balance_global(user_id);  // Tier-1: global conn
-        if (balance < 0) balance = 0.0;
-
-        g_input_active.store(true);
-        wait_for_logger();
-        ui_wizard_show_amount(user_id, user_name, txn_type, balance,
-                              recipient_id, recipient_name);
-        if (!wizard_read_line("Enter amount or 'q' to quit: ",
-                               line, sizeof(line))) break;
-        if (is_quit(line)) { logger_log(ThreadType::PRODUCER,id,"User exited wizard."); break; }
-
+        ui_wizard_clear();
+        ui_wizard_print(0, 0, "Enter Amount:", CP_HEADER);
+        if (!wizard_read_line("Amount $: ", line, sizeof(line))) break;
         double amount = atof(line);
-        if (amount <= 0) {
-            ui_wizard_error("Amount must be greater than zero."); continue;
-        }
-        if (amount > 10000) {
-            ui_wizard_error("Maximum per transaction is $10,000."); continue;
-        }
-        if ((strcmp(txn_type,"WITHDRAWAL")==0 ||
-             strcmp(txn_type,"TRANSFER")  ==0) &&
-             balance > 0 && amount > balance) {
-            ui_wizard_error(
-                "Amount exceeds your balance. The validator will reject this.");
-            if (!wizard_read_line("Submit anyway? [y/n]: ",
-                                   line, sizeof(line))) break;
-            if (line[0]!='y' && line[0]!='Y') {
-                ui_wizard_show_cancelled(); continue;
-            }
-        }
+        if (amount <= 0) continue;
 
-        // ── STEP 4: Confirm ───────────────────────────────────
-        g_input_active.store(true);
-        wait_for_logger();
-        ui_wizard_show_confirm(user_id, user_name, txn_type, amount,
-                               recipient_id, recipient_name);
-        if (!wizard_read_line(
-                "Press Enter to CONFIRM or 'c' to cancel: ",
-                line, sizeof(line))) break;
-        if (line[0]=='c' || line[0]=='C') {
-            ui_wizard_show_cancelled(); continue;
-        }
+        // Confirmation
+        ui_wizard_clear();
+        char conf[128];
+        snprintf(conf, sizeof(conf), "Submit %s of $%.2f for %s?", txn_type, amount, user_name);
+        ui_wizard_print(0, 0, conf, CP_HEADER);
+        if (!wizard_read_line("Press Enter to confirm (c to cancel): ", line, sizeof(line))) break;
+        if (line[0] == 'c') continue;
 
-        // ── Submit ────────────────────────────────────────────
+        // Submit
         Transaction txn;
         txn.transaction_id = g_next_txn_id.fetch_add(1);
-        txn.user_id        = user_id;
-        txn.amount         = amount;
+        txn.user_id = user_id;
+        txn.amount = amount;
         strncpy(txn.transaction_type, txn_type, MAX_TYPE_LEN-1);
-        txn.timestamp      = time(nullptr);
-        txn.retry_count    = 0;
-
+        txn.timestamp = time(nullptr);
         if (recipient_id > 0) {
             txn.recipient_id = recipient_id;
             strncpy(txn.recipient_name, recipient_name, MAX_NAME_LEN-1);
         }
 
-        db_insert_raw_transaction(txn.transaction_id, txn.user_id,
-                                  txn.amount,
-                                  std::string(txn.transaction_type));
-
-        usleep(AUTO_TRANSITION_DELAY_US);
+        db_insert_raw_transaction(txn.transaction_id, txn.user_id, txn.amount, std::string(txn.transaction_type));
         shm_buffer_produce(buf, txn);
-
-        // Show success — set flag first so no logs interrupt
-        g_input_active.store(true);
-        wait_for_logger();
-        ui_wizard_show_queued(txn.transaction_id,
-                              user_id, user_name,
-                              txn_type, amount,
-                              recipient_id, recipient_name);
-        g_input_active.store(false);
-
-        // Log after panel is drawn
-        std::string log_msg =
-            "Transaction #" + std::to_string(txn.transaction_id)
-            + " submitted  |  " + std::string(user_name)
-            + "  |  " + txn_type
-            + "  |  $" + std::to_string((int)amount);
-        if (recipient_id > 0)
-            log_msg += "  |  To: " + std::string(recipient_name);
-        log_msg += "  |  Now in validation queue";
-        logger_log(ThreadType::PRODUCER, id, log_msg);
-
-        // ── Wait for Validation ───────────────────────────────
-        // The user specifically requested that the wizard wait 
-        // until the pipeline finishes processing before prompting.
-        while (g_running.load()) {
-            std::string status = db_get_raw_status(txn.transaction_id);
-            if (status == "DONE" || status == "REJECTED" || status == "FAILED") {
-                // Let the logger print the final acceptance/rejection log
-                usleep(300000); 
-                break;
-            }
-            usleep(100000); // Poll every 100ms
-        }
-
-        // ── Another transaction? ──────────────────────────────
-        // Set flag BEFORE drawing panel so zero log lines can
-        // appear between the panel bottom border and the prompt.
-        g_input_active.store(true);
-        wait_for_logger();
-        ui_wizard_ask_another();
-        // wizard_read_line keeps flag true until Enter pressed
-        if (!wizard_read_line("Your choice: ",
-                               line, sizeof(line))) break;
-
-        if (is_quit(line)||line[0]=='q'||line[0]=='Q'||line[0]=='0') {
-            logger_log(ThreadType::PRODUCER, id, "User exited wizard.");
-            break;
-        }
+        
+        logger_log(ThreadType::PRODUCER, id, "Transaction #" + std::to_string(txn.transaction_id) + " submitted.");
+        
+        ui_wizard_clear();
+        ui_wizard_print(1, 0, "Transaction Queued!", CP_SUCCESS);
+        usleep(1000000);
     }
 
-    g_input_active.store(false);
-    logger_log(ThreadType::PRODUCER, id, "Manual input wizard closed.");
-
-    // Only trigger a full system shutdown if we are the ONLY mode running.
-    // In combined mode (auto + manual), quitting the wizard just closes it;
-    // the auto producers keep running until Ctrl+C.
-    if (manual_only) {
-        g_running.store(false);
-    }
-
+    if (manual_only) g_running.store(false);
     return nullptr;
 }

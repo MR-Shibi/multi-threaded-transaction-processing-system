@@ -40,13 +40,15 @@ void* updater_thread(void* args) {
 
     logger_log(ThreadType::UPDATER, id,
                "Database writer ready. Waiting for validated transactions.");
+    ui_set_thread_status("UPDATER", id, "Idle — waiting for queries");
 
     char raw_query[FIFO_MSG_SIZE];
     char wrapped[FIFO_MSG_SIZE + 32];
 
     while (fifo_read_query(read_fd, raw_query)) {
 
-        if (g_running.load()) usleep(AUTO_TRANSITION_DELAY_US);
+        ui_set_thread_status("UPDATER", id, "Executing SQL...");
+        if (g_running.load()) usleep(100000); // 100ms transition delay
 
         wrap_in_transaction(raw_query, wrapped, sizeof(wrapped));
         bool ok = db_execute(conn, std::string(wrapped));  // Tier 2: no mutex
@@ -83,11 +85,10 @@ void* updater_thread(void* args) {
                     + " of $" + std::to_string((int)amount)
                     + "  |  Total saved today: "
                     + std::to_string(committed);
+                ui_history_push(txn_id, type, amount, true);
+                char st[72]; snprintf(st, 72, "Saved #%d (%s $%.0f)  total:%d", txn_id, type, amount, committed);
+                ui_set_thread_status("UPDATER", id, st);
             } else {
-                // INSERT was skipped by "changes() > 0" guard — a concurrent
-                // transaction already consumed the funds. This is correct
-                // behavior, not an error. The raw_transaction stays as DONE
-                // (the validator approved it) but no money moved.
                 msg = "Transaction executed (funds may have been taken by "
                       "concurrent txn).  Total: " + std::to_string(committed);
             }
@@ -95,6 +96,9 @@ void* updater_thread(void* args) {
 
         } else {
             failed++;
+            ui_history_push(-1, "UNKNOWN", 0, false);
+            char st[72]; snprintf(st, 72, "FAILED  total_fail:%d", failed);
+            ui_set_thread_status("UPDATER", id, st);
             logger_log(ThreadType::UPDATER, id,
                 "Failed to save transaction.  Total failures: "
                 + std::to_string(failed));

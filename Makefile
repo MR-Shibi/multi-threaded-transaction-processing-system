@@ -1,40 +1,14 @@
 # ============================================================
 #  Makefile — Multi-Threaded Transaction Processing System
-#  OS Project — Phase 10: Final Submission
-#
-#  Prerequisites (install once):
-#    sudo apt-get install libsqlite3-dev sqlite3
-#
-#  Targets:
-#    make          — build the binary
-#    make run      — build and run (automatic + manual mode)
-#    make auto     — build and run automatic mode only
-#    make manual   — build and run manual mode only
-#    make clean    — remove compiled files and database
-#    make db       — open the database in sqlite3 shell
-#    make help     — show this help
-# ============================================================
-# ============================================================
-#  Makefile — Multi-Threaded Transaction Processing System
-#  OS Project — Phase 10 Final + Rich Terminal UI
-#
-#  Prerequisites:
-#    sudo apt-get install libsqlite3-dev sqlite3
-#
-#  Targets:
-#    make          build
-#    make run      build + run (auto + manual)
-#    make auto     build + run automatic only
-#    make manual   build + run manual only
-#    make db       open sqlite3 shell
-#    make clean    remove build artifacts
-#    make help     show usage
+#  OS Project — Final Dashboard with ncurses
 # ============================================================
 
 CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -g -pthread -Wno-format-extra-args
 TARGET   := txn_system
-LDFLAGS  := -lpthread -lrt -lsqlite3
+
+# LDFLAGS must include ncurses for the new UI
+LDFLAGS  := -lpthread -lrt -lsqlite3 -lncurses -lncursesw
 
 SRCS :=	main.cpp          \
 	shared_buffer.cpp  \
@@ -55,10 +29,7 @@ $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo ""
 	@echo "  Build successful!"
-	@echo "  Run:  ./$(TARGET)           (auto + manual)"
-	@echo "  Run:  ./$(TARGET) --auto    (automatic only)"
-	@echo "  Run:  ./$(TARGET) --manual  (manual input only)"
-	@echo "  Stop: Ctrl+C               (graceful shutdown)"
+	@echo "  Run:  ./$(TARGET)"
 	@echo ""
 
 %.o: %.cpp
