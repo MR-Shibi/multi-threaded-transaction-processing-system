@@ -18,7 +18,7 @@
 
 #include <semaphore.h>    // sem_t, sem_init, sem_wait, sem_post
 #include <pthread.h>      // pthread_mutex_t
-#include "transaction.h"
+#include "Transaction.h"
 
 // Maximum number of Transaction slots in the circular buffer.
 // Tune this based on how fast producers vs validators run.
