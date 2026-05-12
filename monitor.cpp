@@ -1,9 +1,3 @@
-// ============================================================
-//  monitor.cpp — Updated with human-readable snapshot labels
-//  FIX: WARNING threshold raised to >3 to avoid false alarms
-//       when a single transaction is in PENDING briefly
-// ============================================================
-
 #include "monitor.h"
 #include "shared_buffer.h"
 #include "database.h"
@@ -13,17 +7,21 @@
 #include <unistd.h>
 #include <ctime>
 #include <cstdio>
-#include <atomic>
+#include <pthread.h>
 #include <string>
 
-extern std::atomic<bool> g_running;
-extern std::atomic<bool> g_input_active;
+extern volatile sig_atomic_t g_running;
+extern bool g_input_active;
+extern pthread_mutex_t g_input_mutex;
 
+
+// Internal structure to hold a snapshot of database statistics for reporting.
 struct SystemStats {
     int done, rejected, pending, processing, committed;
     int dep, wth, trn;
 };
 
+// Helper to query multiple database counters, providing a unified view of the system state.
 static SystemStats get_system_stats() {
     SystemStats s;
     s.done       = db_count_raw_by_status("DONE");
@@ -37,6 +35,7 @@ static SystemStats get_system_stats() {
     return s;
 }
 
+// Monitor thread function; runs in a loop to periodically update the UI with system performance data.
 void* monitor_thread(void* args) {
     MonitorArgs*        a   = static_cast<MonitorArgs*>(args);
     SharedMemoryBuffer* buf = a->buffer;
@@ -54,8 +53,10 @@ void* monitor_thread(void* args) {
     do {
         sleep(MONITOR_INTERVAL_SEC);
 
-        // Skip if user is mid-input — never interrupt the wizard
-        if (g_input_active.load()) {
+        pthread_mutex_lock(&g_input_mutex);
+        bool input_active = g_input_active;
+        pthread_mutex_unlock(&g_input_mutex);
+        if (input_active) {
             continue;
         }
 
@@ -93,10 +94,13 @@ void* monitor_thread(void* args) {
         prev_rejected  = s.rejected;
         prev_time      = now;
 
-    } while (g_running.load());
+        if (!g_running) break;
+    } while (true);
 
-    // Final update at shutdown
-    if (!g_input_active.load()) {
+    pthread_mutex_lock(&g_input_mutex);
+    bool input_active_fin = g_input_active;
+    pthread_mutex_unlock(&g_input_mutex);
+    if (!input_active_fin) {
         SystemStats s = get_system_stats();
         ui_update_monitor(
             snapshot_num + 1,

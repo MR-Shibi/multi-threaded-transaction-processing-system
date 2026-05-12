@@ -1,11 +1,3 @@
-// ============================================================
-//  logger.cpp
-//  DEDICATED LOGGER THREAD — Updated with rich UI formatting
-//
-//  Now uses ui_format_log() to produce colored, symbol-tagged
-//  log lines instead of plain text.
-// ============================================================
-
 #include "logger.h"
 #include "ui.h"
 
@@ -16,23 +8,24 @@
 #include <cstring>
 #include <ctime>
 #include <unistd.h>
+#include <pthread.h>
 
-// ── Module-level state ───────────────────────────────────────
 static std::queue<LogMessage> g_log_queue;
 static pthread_mutex_t        g_queue_mutex;
 static sem_t                  g_queue_sem;
 static pthread_t              g_logger_thread;
 
-#include <atomic>
-extern std::atomic<bool> g_input_active;
+extern bool g_input_active;
+extern pthread_mutex_t g_input_mutex;
 
-// ── Format time ──────────────────────────────────────────────
+
+// Formats a timestamp into a human-readable string; thread-safe by using local buffers.
 static void format_time(time_t t, char* buf, int buf_size) {
     struct tm* tm_info = localtime(&t);
     strftime(buf, buf_size, "%H:%M:%S", tm_info);
 }
 
-// ── Thread type to string ────────────────────────────────────
+// Maps thread type enum to a display string; pure function with no shared state.
 static constexpr const char* type_str(ThreadType t) {
     switch (t) {
         case ThreadType::PRODUCER:  return "PRODUCER";
@@ -44,7 +37,7 @@ static constexpr const char* type_str(ThreadType t) {
     }
 }
 
-// ── Print one message ─────────────────────────────────────────
+// Sends a formatted message to the UI; called within the logger thread context.
 static void print_message(const LogMessage& msg) {
     char time_buf[16];
     format_time(msg.timestamp, time_buf, sizeof(time_buf));
@@ -57,9 +50,8 @@ static void print_message(const LogMessage& msg) {
     );
 }
 
-// ── Logger thread ─────────────────────────────────────────────
+// The consumer thread function; uses a semaphore to wait for new log messages and a mutex for queue access.
 static void* logger_thread_func(void*) {
-    // Startup line using UI formatting
     char now_buf[16];
     time_t now = time(nullptr);
     struct tm* tm_info = localtime(&now);
@@ -70,10 +62,12 @@ static void* logger_thread_func(void*) {
     while (true) {
         sem_wait(&g_queue_sem);
 
-        // Pause logging if the user is currently typing in the manual wizard.
-        // This keeps the wizard's panel clean and prevents interleaving.
-        while (g_input_active.load()) {
-            usleep(50000); // 50ms check
+        while (true) {
+            pthread_mutex_lock(&g_input_mutex);
+            bool input_active = g_input_active;
+            pthread_mutex_unlock(&g_input_mutex);
+            if (!input_active) break;
+            usleep(50000);
         }
 
         pthread_mutex_lock(&g_queue_mutex);
@@ -82,7 +76,6 @@ static void* logger_thread_func(void*) {
         pthread_mutex_unlock(&g_queue_mutex);
 
         if (msg.shutdown) {
-            // Drain remaining messages
             pthread_mutex_lock(&g_queue_mutex);
             while (!g_log_queue.empty()) {
                 LogMessage rem = g_log_queue.front();
@@ -107,13 +100,14 @@ static void* logger_thread_func(void*) {
     return nullptr;
 }
 
-// ── Public API ────────────────────────────────────────────────
+// Initializes logging synchronization primitives (mutex and semaphore) and spawns the consumer thread.
 void logger_init() {
     pthread_mutex_init(&g_queue_mutex, nullptr);
     sem_init(&g_queue_sem, 0, 0);
     pthread_create(&g_logger_thread, nullptr, logger_thread_func, nullptr);
 }
 
+// Thread-safe producer function; pushes logs to the queue and signals the semaphore to wake the logger thread.
 void logger_log(ThreadType type, int thread_num, const std::string& msg) {
     LogMessage lm(type, thread_num, msg);
     pthread_mutex_lock(&g_queue_mutex);
@@ -122,6 +116,7 @@ void logger_log(ThreadType type, int thread_num, const std::string& msg) {
     sem_post(&g_queue_sem);
 }
 
+// Signals the logger thread to finish remaining logs and terminate; cleans up OS synchronization objects.
 void logger_shutdown() {
     LogMessage sentinel;
     pthread_mutex_lock(&g_queue_mutex);

@@ -1,37 +1,28 @@
 #ifndef MONITOR_H
 #define MONITOR_H
 
-// ============================================================
-//  monitor.h — Monitor Thread
-//
-//  Wakes every MONITOR_INTERVAL_SEC seconds and prints a
-//  live system snapshot.
-//
-//  KEY ADDITION: g_input_active flag
-//    When the manual wizard is waiting for user input,
-//    it sets g_input_active = true.
-//    The monitor sees this and SKIPS printing that cycle
-//    so it never interrupts an active input prompt.
-//    Once the wizard finishes a full transaction (or cancels),
-//    g_input_active is set back to false.
-// ============================================================
-
 #include "shared_buffer.h"
-#include <atomic>
+#include <pthread.h>
+#include <csignal>
 
-// How often the monitor wakes up (seconds)
 static const int MONITOR_INTERVAL_SEC = 2;
 
-// ── Global flag: true while wizard is waiting for keypress ──
-// Defined in main.cpp, extern'd everywhere it's needed.
-extern std::atomic<bool> g_input_active;
+extern volatile sig_atomic_t g_running;
 
-// ── Thread arguments ─────────────────────────────────────────
+extern int g_next_txn_id;
+extern pthread_mutex_t g_txn_id_mutex;
+
+extern bool g_input_active;
+extern pthread_mutex_t g_input_mutex;
+
+
+// Structure to pass shared resources and identification to the monitor thread.
 struct MonitorArgs {
     SharedMemoryBuffer* buffer;
     int                 thread_id;
 };
 
+// Thread function that periodically gathers system statistics from the database and shared buffer.
 void* monitor_thread(void* args);
 
 #endif // MONITOR_H

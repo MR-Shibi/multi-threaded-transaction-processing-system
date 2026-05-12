@@ -21,19 +21,17 @@ static constexpr const char* STATUS_REJECTED   = "REJECTED";
 static constexpr const char* STATUS_PAID       = "PAID";
 static constexpr const char* STATUS_FAILED     = "FAILED";
 
+// Represents a financial transaction data structure; shared across threads using synchronization primitives.
 struct Transaction {
-    // ── Producer fields ──────────────────────────────────────
     int    transaction_id;
     int    user_id;
     double amount;
     char   transaction_type[MAX_TYPE_LEN];
     time_t timestamp;
     int    retry_count;
-    // For TRANSFER: recipient (0 = not a transfer or auto-generated)
     int    recipient_id;
     char   recipient_name[MAX_NAME_LEN];
 
-    // ── Validator fields ─────────────────────────────────────
     char   validation_status[MAX_STATUS_LEN];
     char   rejection_reason[MAX_REASON_LEN];
     double user_balance_at_time;
@@ -42,22 +40,17 @@ struct Transaction {
     time_t validation_timestamp;
     char   commit_query[MAX_QUERY_LEN];
 
-    // ── DB Updater fields ────────────────────────────────────
     char   final_status[MAX_STATUS_LEN];
     double balance_after;
     time_t commit_timestamp;
     long   updater_thread_id;
 
-    // ── Poison Pill ──────────────────────────────────────────
-    // When true, this is a shutdown signal — not a real transaction.
-    // Consumers (validators) must exit their loop immediately upon
-    // receiving this instead of trying to process it.
     bool is_shutdown;
 
+    // Initializes a transaction with zeroed memory; critical for consistent state before shared access.
     Transaction() { memset(this, 0, sizeof(Transaction)); }
 
-    // Factory: creates a poison-pill transaction for graceful shutdown.
-    // main() produces one of these per validator thread.
+    // Creates a special "poison pill" transaction to signal worker threads to terminate via thread-safe queues.
     static Transaction make_shutdown_pill() {
         Transaction t;
         t.is_shutdown = true;

@@ -1,13 +1,6 @@
-# ============================================================
-#  Makefile — Multi-Threaded Transaction Processing System
-#  OS Project — Final Dashboard with ncurses
-# ============================================================
-
 CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -g -pthread -Wno-format-extra-args
 TARGET   := txn_system
-
-# LDFLAGS include pthread, rt (for shm), sqlite3, and ncurses
 LDFLAGS  := -lpthread -lrt -lsqlite3 -lncursesw
 
 SRCS := main.cpp          \
