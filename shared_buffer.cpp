@@ -9,6 +9,34 @@
 #include <cstdio>
 #include "logger.h"
 
+// Implements the producer logic: decrements 'empty' semaphore, locks mutex, inserts data, then increments 'filled' semaphore.
+void shm_buffer_produce(SharedMemoryBuffer* buf, const Transaction& txn) {
+    sem_wait(&buf->sem_empty);
+    pthread_mutex_lock(&buf->mutex);
+
+    buf->data[buf->tail] = txn;
+    buf->tail = (buf->tail + 1) % SHARED_BUFFER_SIZE;
+    buf->count++;
+
+    pthread_mutex_unlock(&buf->mutex);
+    sem_post(&buf->sem_filled);
+}
+
+// Implements the consumer logic: decrements 'filled' semaphore, locks mutex, removes data, then increments 'empty' semaphore.
+Transaction shm_buffer_consume(SharedMemoryBuffer* buf) {
+    sem_wait(&buf->sem_filled);
+    pthread_mutex_lock(&buf->mutex);
+
+    Transaction txn = buf->data[buf->head];
+    buf->head = (buf->head + 1) % SHARED_BUFFER_SIZE;
+    buf->count--;
+
+    pthread_mutex_unlock(&buf->mutex);
+    sem_post(&buf->sem_empty);
+
+    return txn;
+}
+
 // Sets up the shared memory segment and initializes the embedded mutex and semaphores for process sharing.
 SharedMemoryBuffer* shm_buffer_create() {
     int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR | O_TRUNC, 0600);
@@ -104,34 +132,6 @@ void shm_buffer_destroy(SharedMemoryBuffer* buf) {
     shm_unlink(SHM_NAME);
 
     logger_log(ThreadType::SYSTEM, 0, "Shared memory segment released and cleaned up.");
-}
-
-// Implements the producer logic: decrements 'empty' semaphore, locks mutex, inserts data, then increments 'filled' semaphore.
-void shm_buffer_produce(SharedMemoryBuffer* buf, const Transaction& txn) {
-    sem_wait(&buf->sem_empty);
-    pthread_mutex_lock(&buf->mutex);
-
-    buf->data[buf->tail] = txn;
-    buf->tail = (buf->tail + 1) % SHARED_BUFFER_SIZE;
-    buf->count++;
-
-    pthread_mutex_unlock(&buf->mutex);
-    sem_post(&buf->sem_filled);
-}
-
-// Implements the consumer logic: decrements 'filled' semaphore, locks mutex, removes data, then increments 'empty' semaphore.
-Transaction shm_buffer_consume(SharedMemoryBuffer* buf) {
-    sem_wait(&buf->sem_filled);
-    pthread_mutex_lock(&buf->mutex);
-
-    Transaction txn = buf->data[buf->head];
-    buf->head = (buf->head + 1) % SHARED_BUFFER_SIZE;
-    buf->count--;
-
-    pthread_mutex_unlock(&buf->mutex);
-    sem_post(&buf->sem_empty);
-
-    return txn;
 }
 
 // Thread-safe query for the current buffer occupancy level.

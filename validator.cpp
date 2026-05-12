@@ -66,22 +66,6 @@ static void build_commit_query(Transaction &txn) {
   }
 }
 
-// Marks a transaction as rejected in the database and logs the failure.
-static void reject_transaction(Transaction &txn, const char *reason,
-                               int thread_id) {
-  strncpy(txn.validation_status, STATUS_REJECTED, MAX_STATUS_LEN - 1);
-  strncpy(txn.rejection_reason, reason, MAX_REASON_LEN - 1);
-  txn.validation_timestamp = time(nullptr);
-  txn.validator_thread_id = (long)pthread_self();
-  db_update_raw_status(txn.transaction_id, "REJECTED");
-
-  logger_log(ThreadType::VALIDATOR, thread_id,
-             "Transaction #" + std::to_string(txn.transaction_id) +
-                 " REJECTED  |  User:" + std::to_string(txn.user_id) +
-                 "  |  $" + std::to_string((int)txn.amount) + " " +
-                 txn.transaction_type + "  |  Reason: " + reason);
-}
-
 // Entry point for validator threads; synchronizes with producers via shared memory semaphores.
 void *validator_thread(void *args) {
   ValidatorArgs *a = static_cast<ValidatorArgs *>(args);
@@ -209,4 +193,20 @@ void *validator_thread(void *args) {
                  " accepted  |  " + std::to_string(rejected) + " rejected");
 
   return nullptr;
+}
+
+// Marks a transaction as rejected in the database and logs the failure.
+void reject_transaction(Transaction &txn, const char *reason,
+                               int thread_id) {
+  strncpy(txn.validation_status, STATUS_REJECTED, MAX_STATUS_LEN - 1);
+  strncpy(txn.rejection_reason, reason, MAX_REASON_LEN - 1);
+  txn.validation_timestamp = time(nullptr);
+  txn.validator_thread_id = (long)pthread_self();
+  db_update_raw_status(txn.transaction_id, "REJECTED");
+
+  logger_log(ThreadType::VALIDATOR, thread_id,
+             "Transaction #" + std::to_string(txn.transaction_id) +
+                 " REJECTED  |  User:" + std::to_string(txn.user_id) +
+                 "  |  $" + std::to_string((int)txn.amount) + " " +
+                 txn.transaction_type + "  |  Reason: " + reason);
 }

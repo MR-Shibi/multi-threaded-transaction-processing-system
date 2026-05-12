@@ -2,6 +2,7 @@
 #define PRODUCER_H
 
 #include "shared_buffer.h"
+#include <sqlite3.h>
 
 enum class ProducerStyle {
     SLOW,
@@ -21,5 +22,11 @@ struct ProducerArgs {
 void* producer_thread(void* args);
 // Entry point for manual producer thread; captures keyboard input to generate transactions.
 void* manual_producer_thread(void* args);
+
+bool wizard_read_line(const char *prompt, char *buf, int buf_size);
+
+bool is_quit(const char *s);
+
+Transaction make_transaction(sqlite3* conn, int thread_id);
 
 #endif // PRODUCER_H

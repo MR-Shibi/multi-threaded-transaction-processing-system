@@ -44,66 +44,6 @@ static constexpr const char *get_user_name(int uid) {
   return "Unknown";
 }
 
-// Blocks to read a line of input from the UI, updating an atomic flag to pause background logging.
-static bool wizard_read_line(const char *prompt, char *buf, int buf_size) {
-  pthread_mutex_lock(&g_input_mutex);
-  g_input_active = true;
-  pthread_mutex_unlock(&g_input_mutex);
-  bool ok = ui_wizard_get_string(buf, buf_size, prompt);
-  pthread_mutex_lock(&g_input_mutex);
-  g_input_active = false;
-  pthread_mutex_unlock(&g_input_mutex);
-  if (!ok || strlen(buf) == 0)
-    return false;
-  return true;
-}
-
-// Checks if a user-entered string is a termination command.
-static bool is_quit(const char *s) {
-  return strcmp(s, "quit") == 0 || strcmp(s, "exit") == 0 ||
-         strcmp(s, "q") == 0;
-}
-
-// Generates a random transaction and inserts it into the database; uses atomic increment for unique IDs.
-static Transaction make_transaction(sqlite3* conn, int thread_id) {
-  Transaction txn;
-  pthread_mutex_lock(&g_txn_id_mutex);
-  txn.transaction_id = g_next_txn_id++;
-  pthread_mutex_unlock(&g_txn_id_mutex);
-
-  int sender_idx = rand() % NUM_USERS;
-  txn.user_id = USERS[sender_idx].id;
-
-  txn.amount = (double)((rand() % 19) + 1) * 50.0;
-  int type_idx = rand() % 3;
-  strncpy(txn.transaction_type, TXN_TYPES[type_idx], MAX_TYPE_LEN - 1);
-  txn.timestamp = time(nullptr);
-  txn.retry_count = 0;
-
-  if (strcmp(txn.transaction_type, "TRANSFER") == 0) {
-    int rec_idx;
-    do {
-      rec_idx = rand() % NUM_USERS;
-    } while (rec_idx == sender_idx);
-
-    txn.recipient_id = USERS[rec_idx].id;
-    strncpy(txn.recipient_name, USERS[rec_idx].name, MAX_NAME_LEN - 1);
-  }
-
-  db_insert_raw_transaction(conn, txn.transaction_id, txn.user_id, txn.amount,
-                            std::string(txn.transaction_type));
-
-  std::string msg = "New transaction created  |  " +
-                    std::string(get_user_name(txn.user_id)) + "  |  " +
-                    txn.transaction_type + "  |  $" +
-                    std::to_string((int)txn.amount);
-
-  if (txn.recipient_id > 0)
-    msg += "  |  To: " + std::string(txn.recipient_name);
-
-  logger_log(ThreadType::PRODUCER, thread_id, msg);
-  return txn;
-}
 
 // Entry point for automated producer threads; synchronizes with consumers via the shared buffer's semaphores.
 void *producer_thread(void *args) {
@@ -336,4 +276,65 @@ void *manual_producer_thread(void *args) {
     g_running = 0;
   }
   return nullptr;
+}
+
+// Blocks to read a line of input from the UI, updating an atomic flag to pause background logging.
+bool wizard_read_line(const char *prompt, char *buf, int buf_size) {
+  pthread_mutex_lock(&g_input_mutex);
+  g_input_active = true;
+  pthread_mutex_unlock(&g_input_mutex);
+  bool ok = ui_wizard_get_string(buf, buf_size, prompt);
+  pthread_mutex_lock(&g_input_mutex);
+  g_input_active = false;
+  pthread_mutex_unlock(&g_input_mutex);
+  if (!ok || strlen(buf) == 0)
+    return false;
+  return true;
+}
+
+// Checks if a user-entered string is a termination command.
+bool is_quit(const char *s) {
+  return strcmp(s, "quit") == 0 || strcmp(s, "exit") == 0 ||
+         strcmp(s, "q") == 0;
+}
+
+// Generates a random transaction and inserts it into the database; uses atomic increment for unique IDs.
+Transaction make_transaction(sqlite3* conn, int thread_id) {
+  Transaction txn;
+  pthread_mutex_lock(&g_txn_id_mutex);
+  txn.transaction_id = g_next_txn_id++;
+  pthread_mutex_unlock(&g_txn_id_mutex);
+
+  int sender_idx = rand() % NUM_USERS;
+  txn.user_id = USERS[sender_idx].id;
+
+  txn.amount = (double)((rand() % 19) + 1) * 50.0;
+  int type_idx = rand() % 3;
+  strncpy(txn.transaction_type, TXN_TYPES[type_idx], MAX_TYPE_LEN - 1);
+  txn.timestamp = time(nullptr);
+  txn.retry_count = 0;
+
+  if (strcmp(txn.transaction_type, "TRANSFER") == 0) {
+    int rec_idx;
+    do {
+      rec_idx = rand() % NUM_USERS;
+    } while (rec_idx == sender_idx);
+
+    txn.recipient_id = USERS[rec_idx].id;
+    strncpy(txn.recipient_name, USERS[rec_idx].name, MAX_NAME_LEN - 1);
+  }
+
+  db_insert_raw_transaction(conn, txn.transaction_id, txn.user_id, txn.amount,
+                            std::string(txn.transaction_type));
+
+  std::string msg = "New transaction created  |  " +
+                    std::string(get_user_name(txn.user_id)) + "  |  " +
+                    txn.transaction_type + "  |  $" +
+                    std::to_string((int)txn.amount);
+
+  if (txn.recipient_id > 0)
+    msg += "  |  To: " + std::string(txn.recipient_name);
+
+  logger_log(ThreadType::PRODUCER, thread_id, msg);
+  return txn;
 }

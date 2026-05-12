@@ -13,4 +13,7 @@ struct ValidatorArgs {
 // Entry point for validator threads; synchronizes with producers via shared memory semaphores.
 void* validator_thread(void* args);
 
+void reject_transaction(Transaction &txn, const char *reason,
+                               int thread_id);
+
 #endif // VALIDATOR_H
